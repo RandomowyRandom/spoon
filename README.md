@@ -28,16 +28,21 @@ Spoon drives the `git` command line, so Git must be installed.
 
 - Commit graph with branches, tags and remote refs; search by message, author, file or content
 - Local changes: stage, unstage, discard, commit, amend, sign off, commit and push
-- Branches: create, check out, rename, delete, track remote branches
+- Branches: create, check out, rename, delete, track remote branches; shown as a
+  foldable tree grouped by their `/` prefixes (`feat/…`, `fix/…`)
 - Merge (default, no fast-forward, fast-forward only, squash), rebase, cherry-pick, revert, reset
-- Conflicts: resolve with ours or theirs, then continue, skip or abort
+- Conflict editor in its own window: pick single lines from either side, edit the result,
+  then continue, skip or abort; whole-file "use ours" and "use theirs" as well
 - Remotes: fetch, pull (merge or rebase), push (with lease), add and remove remotes
 - Tags and stashes, including pushing and deleting tags on a remote
+- Worktrees: add, remove, prune
+- Multi-select in the sidebar (Ctrl or Shift click) with batch delete for branches,
+  remote branches, tags and worktrees
 - Unified diff viewer, file history, blame, command log
-- Clone, init, tabs for several repositories, submodule and worktree lists
+- Clone, init, tabs for several repositories, submodule list
 
-Not ported from SourceGit yet: interactive rebase, hunk and line staging, a merge
-conflict editor, git-flow, LFS, bisect, image diff, statistics, custom actions,
+Not ported from SourceGit yet: interactive rebase, hunk and line staging, launching an
+external merge tool, git-flow, LFS, bisect, image diff, statistics, custom actions,
 workspaces, issue links, AI commit messages, translations, per-remote SSH keys.
 
 ## Requirements
@@ -110,6 +115,8 @@ Preferences are stored in `%APPDATA%\Spoon\preference.json` on Windows and in
 | `src/widgets.rs` | Material 3 Expressive components |
 | `src/repo.rs` | Repository view: history, changes, stashes |
 | `src/dialogs.rs` | Operation dialogs |
+| `src/conflict.rs` | Merge conflict model: parse markers, pick lines, render |
+| `src/merge_editor.rs` | Conflict editor UI |
 | `src/app.rs` | Tabs, welcome page, clone, appearance settings |
 | `src/icon.rs` | The logo, generated in code (`spoon --export-logo assets`) |
 | `src/tests.rs` | Git workflow tests |

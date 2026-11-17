@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::git::{self, Change, DiffSpec, Head, InProgress, LogQuery, MergeMode, Op, RefKind, ResetMode, SearchBy};
+use crate::conflict::{self, Document, FileState, Segment, Side, Take};
 use crate::{diff, graph};
 
 // ---------------------------------------------------------------- harness
@@ -174,6 +175,13 @@ fn head_subject(repo: &Path) -> String {
 
 fn change<'a>(changes: &'a [Change], path: &str) -> &'a Change {
     changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("no change for {path} in {changes:?}"))
+}
+
+/// The conflicted change for `path`, as the UI would hand it to `Op::Resolve`.
+fn conflict_of(repo: &Path, path: &str) -> Change {
+    let found = change(&git::status(repo), path).clone();
+    assert!(found.conflicted(), "{path} is not in conflict: {found:?}");
+    found
 }
 
 fn current(repo: &Path) -> String {
@@ -526,7 +534,7 @@ fn merge_conflict_resolve_ours_or_theirs_then_continue() {
         fails(&repo, Op::Continue(InProgress::Merge));
         assert_eq!(git::in_progress(&repo), InProgress::Merge);
 
-        op(&repo, Op::Resolve { path: "f.txt".into(), theirs });
+        op(&repo, Op::Resolve { change: conflict_of(&repo, "f.txt"), theirs });
         assert!(!git::status(&repo).iter().any(Change::conflicted));
         op(&repo, Op::Continue(InProgress::Merge));
 
@@ -598,7 +606,7 @@ fn rebase_conflict_abort_continue_and_skip() {
     diverge(&repo);
     fails(&repo, Op::Rebase { onto: "other".into(), autostash: false });
     fails(&repo, Op::Continue(InProgress::Rebase));
-    op(&repo, Op::Resolve { path: "f.txt".into(), theirs: true });
+    op(&repo, Op::Resolve { change: conflict_of(&repo, "f.txt"), theirs: true });
     op(&repo, Op::Continue(InProgress::Rebase));
     assert_eq!(git::in_progress(&repo), InProgress::None);
     assert_eq!(subjects(&repo), ["ours change", "theirs change", "base"]);
@@ -790,6 +798,578 @@ fn stash_pop_conflict_keeps_the_stash() {
 
     fails(&repo, Op::StashApply { name: "stash@{0}".into(), pop: true });
     assert_eq!(git::stashes(&repo).len(), 1, "a failed pop must not lose the stash");
+}
+
+// ---------------------------------------------------------------- worktrees
+
+#[test]
+fn worktrees_add_remove_and_prune() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    commit(&repo, "a.txt", "a\n", "first");
+    op(&repo, branch("feat", false));
+    let folder = |name: &str| sb.root.join(name).to_str().unwrap().replace('\\', "/");
+    let tree_of = |branch: &str| git::worktrees(&repo).into_iter().find(|t| t.branch == branch).unwrap_or_else(|| panic!("no worktree for {branch}"));
+
+    // An existing branch, and a new branch started at HEAD.
+    op(&repo, Op::WorktreeAdd { path: folder("wt-feat"), target: "feat".into(), new_branch: None });
+    op(&repo, Op::WorktreeAdd { path: folder("wt-topic"), target: "HEAD".into(), new_branch: Some("topic".into()) });
+    let trees = git::worktrees(&repo);
+    assert_eq!(trees.len(), 3);
+    assert!(trees[0].main && trees[0].branch == "main");
+    let feat = tree_of("feat");
+    assert!(!feat.main && !feat.prunable);
+    let feat_dir = PathBuf::from(&feat.path);
+    assert_eq!(read(&feat_dir, "a.txt"), "a\n");
+    assert!(branch_names(&repo).contains(&"topic".to_string()));
+    assert_eq!(current(&repo), "main", "adding a worktree leaves the main checkout alone");
+
+    // A branch can be checked out only once, and the folder must be free.
+    fails(&repo, Op::WorktreeAdd { path: folder("wt-dup"), target: "feat".into(), new_branch: None });
+    // git itself would create the branch `other` and then fail on the folder; Spoon must not.
+    let taken = fails(&repo, Op::WorktreeAdd { path: folder("wt-feat"), target: "HEAD".into(), new_branch: Some("other".into()) });
+    assert!(taken.contains("already exists"), "{taken}");
+    assert!(fails(&repo, Op::WorktreeAdd { path: "relative/dir".into(), target: "feat".into(), new_branch: None }).contains("absolute"));
+    assert_eq!(git::worktrees(&repo).len(), 3);
+    assert!(!branch_names(&repo).contains(&"other".to_string()), "a rejected add must not leave a branch behind");
+
+    // Work committed in a worktree lands on its branch in the shared repository.
+    commit(&feat_dir, "f.txt", "f\n", "work in worktree");
+    assert_eq!(g(&repo, &["log", "-1", "--format=%s", "feat"]), "work in worktree");
+    assert_eq!(git::root(&feat_dir).map(|p| p.join("f.txt").exists()), Some(true));
+
+    // Removing refuses to throw away uncommitted work unless forced.
+    write(&feat_dir, "unsaved.txt", "precious\n");
+    fails(&repo, Op::WorktreeRemove { path: feat.path.clone(), force: false });
+    assert_eq!(read(&feat_dir, "unsaved.txt"), "precious\n");
+    assert_eq!(git::worktrees(&repo).len(), 3);
+    op(&repo, Op::WorktreeRemove { path: feat.path.clone(), force: true });
+    assert!(!feat_dir.exists());
+    assert_eq!(g(&repo, &["log", "-1", "--format=%s", "feat"]), "work in worktree", "removing a worktree keeps its branch and commits");
+
+    // The main work tree is never removable.
+    fails(&repo, Op::WorktreeRemove { path: trees[0].path.clone(), force: true });
+    assert_eq!(read(&repo, "a.txt"), "a\n");
+
+    // A clean worktree goes without force.
+    op(&repo, Op::WorktreeAdd { path: folder("wt-clean"), target: "feat".into(), new_branch: None });
+    op(&repo, Op::WorktreeRemove { path: tree_of("feat").path, force: false });
+
+    // A folder deleted by hand leaves a stale entry until pruned.
+    fs::remove_dir_all(tree_of("topic").path).unwrap();
+    assert!(tree_of("topic").prunable);
+    op(&repo, Op::WorktreePrune);
+    let left = git::worktrees(&repo);
+    assert_eq!(left.len(), 1);
+    assert!(left[0].main && !left[0].prunable);
+    assert!(branch_names(&repo).contains(&"topic".to_string()), "pruning keeps the branch");
+}
+
+// ---------------------------------------------------------------- conflict editor
+
+const TWO_CONFLICTS: &str = "intro\n<<<<<<< HEAD\nours 1\nours 2\n=======\ntheirs 1\n>>>>>>> feature\nmiddle\n<<<<<<< HEAD\nA\n||||||| base\nO\n=======\nB\nC\n>>>>>>> feature\noutro\n";
+
+fn nth_conflict(doc: &mut Document, n: usize) -> &mut conflict::Conflict {
+    doc.conflicts_mut().nth(n).unwrap()
+}
+
+#[test]
+fn conflict_document_parses_and_round_trips() {
+    let doc = Document::parse(TWO_CONFLICTS);
+    assert_eq!((doc.total(), doc.resolved(), doc.segments.len()), (2, 0, 5));
+    assert!(matches!(&doc.segments[0], Segment::Plain(lines) if lines == &["intro"]));
+    let first = doc.conflicts().next().unwrap();
+    assert_eq!(first.current, ["ours 1", "ours 2"]);
+    assert_eq!(first.incoming, ["theirs 1"]);
+    assert_eq!((first.current_label.as_str(), first.incoming_label.as_str()), ("HEAD", "feature"));
+    let second = doc.conflicts().nth(1).unwrap();
+    assert_eq!((second.current.len(), second.incoming.len()), (1, 2), "the diff3 base section is not a side");
+
+    // An untouched document renders byte for byte, whatever its line endings.
+    let samples = [
+        TWO_CONFLICTS.to_string(),
+        TWO_CONFLICTS.replace('\n', "\r\n"),
+        TWO_CONFLICTS.trim_end().to_string(),
+        String::new(),
+        "no conflicts\nhere\n".into(),
+        "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b".into(),
+        "\n\n<<<<<<< HEAD\n=======\n>>>>>>> b\n\n".into(),
+    ];
+    for text in samples {
+        assert_eq!(Document::parse(&text).render(), text, "{text:?}");
+    }
+
+    // Marker look-alikes and cut-off blocks stay plain text and survive unchanged.
+    let not_conflicts = ["=======\ntitle\n=======\n", "<<<<<<< HEAD\nx\n=======\ny\n", "<<<<<<<HEAD\nx\n=======\ny\n>>>>>>>b\n", ">>>>>>> stray\n", "<<<<<<< HEAD\nx\n>>>>>>> b\n"];
+    for text in not_conflicts {
+        let doc = Document::parse(text);
+        assert_eq!((doc.total(), doc.render().as_str()), (0, text));
+    }
+    let nested = Document::parse("<<<<<<< a\n<<<<<<< b\nx\n=======\ny\n>>>>>>> c\n");
+    assert_eq!(nested.total(), 1, "the inner, complete block is the conflict");
+    assert_eq!(nested.conflicts().next().unwrap().current_label, "b");
+}
+
+#[test]
+fn conflict_take_resolves_whole_blocks() {
+    let mut doc = Document::parse(TWO_CONFLICTS);
+    nth_conflict(&mut doc, 0).take(Take::Incoming);
+    assert_eq!((doc.total(), doc.resolved()), (2, 1));
+    assert_eq!(doc.render(), "intro\ntheirs 1\nmiddle\n<<<<<<< HEAD\nA\n||||||| base\nO\n=======\nB\nC\n>>>>>>> feature\noutro\n", "unresolved blocks keep their markers");
+
+    nth_conflict(&mut doc, 1).take(Take::Both);
+    assert_eq!(doc.render(), "intro\ntheirs 1\nmiddle\nA\nB\nC\noutro\n");
+    nth_conflict(&mut doc, 0).take(Take::Current);
+    nth_conflict(&mut doc, 1).take(Take::Neither);
+    assert_eq!(doc.render(), "intro\nours 1\nours 2\nmiddle\noutro\n");
+    assert_eq!(doc.resolved(), 2);
+    nth_conflict(&mut doc, 1).reset();
+    assert_eq!(doc.resolved(), 1);
+    assert!(doc.render().contains("||||||| base"));
+
+    let mut crlf = Document::parse(&TWO_CONFLICTS.replace('\n', "\r\n"));
+    crlf.conflicts_mut().for_each(|c| c.take(Take::Current));
+    assert_eq!(crlf.render(), "intro\r\nours 1\r\nours 2\r\nmiddle\r\nA\r\noutro\r\n");
+
+    let mut everything = Document::parse("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n");
+    nth_conflict(&mut everything, 0).take(Take::Neither);
+    assert_eq!(everything.render(), "", "a file resolved to nothing is empty, not a lone newline");
+}
+
+#[test]
+fn conflict_lines_are_picked_individually() {
+    let mut doc = Document::parse("<<<<<<< HEAD\na1\na2\na3\n=======\nb1\nb2\n>>>>>>> x\n");
+    let c = nth_conflict(&mut doc, 0);
+
+    // The side picked first leads; each side keeps its own order whatever the click order.
+    c.toggle(Side::Incoming, 1);
+    assert!(c.resolved && c.is_picked(Side::Incoming, 1) && !c.is_picked(Side::Incoming, 0));
+    c.toggle(Side::Current, 2);
+    c.toggle(Side::Current, 0);
+    c.toggle(Side::Incoming, 0);
+    assert_eq!(c.result, "b1\nb2\na1\na3\n");
+    c.toggle(Side::Current, 0);
+    assert_eq!(c.result, "b1\nb2\na3\n");
+
+    // Unpicking everything makes the conflict unresolved again.
+    for (side, index) in [(Side::Incoming, 0), (Side::Incoming, 1), (Side::Current, 2)] {
+        c.toggle(side, index);
+    }
+    assert!(!c.resolved && c.result.is_empty());
+
+    // Starting from the other side flips the order.
+    c.toggle(Side::Current, 1);
+    c.toggle(Side::Incoming, 0);
+    assert_eq!(c.result, "a2\nb1\n");
+
+    // A range, given in either direction, picks every line once.
+    c.reset();
+    c.toggle(Side::Current, 2);
+    c.pick_range(Side::Current, 2, 0);
+    assert_eq!(c.result, "a1\na2\na3\n");
+    c.toggle(Side::Current, 99);
+    assert_eq!(c.result, "a1\na2\na3\n", "an index past the end is ignored");
+
+    // The chunk checkbox: a whole side on or off, leaving the other side alone.
+    c.reset();
+    c.toggle(Side::Incoming, 1);
+    c.set_side(Side::Current, true);
+    assert_eq!((c.picked_count(Side::Current), c.picked_count(Side::Incoming)), (3, 1));
+    assert_eq!(c.result, "b2\na1\na2\na3\n");
+    c.set_side(Side::Current, true);
+    assert_eq!(c.result, "b2\na1\na2\na3\n", "already picked lines are not toggled off");
+    c.set_side(Side::Current, false);
+    assert_eq!((c.result.as_str(), c.resolved, c.dropped()), ("b2\n", true, false));
+    c.set_side(Side::Incoming, false);
+    assert!(!c.resolved && !c.dropped());
+    c.take(Take::Neither);
+    assert!(c.resolved && c.dropped());
+
+    // A blank line is a real line.
+    let mut blank = Document::parse("<<<<<<< HEAD\n\nx\n=======\ny\n>>>>>>> b\nend\n");
+    nth_conflict(&mut blank, 0).toggle(Side::Current, 0);
+    assert_eq!(blank.render(), "\nend\n");
+}
+
+#[test]
+fn conflict_result_can_be_edited() {
+    let mut doc = Document::parse("top\n<<<<<<< HEAD\na1\na2\n=======\nb1\n>>>>>>> x\n");
+    let c = nth_conflict(&mut doc, 0);
+    c.toggle(Side::Current, 0);
+    c.edit("a1\n"); // identical text is not an edit
+    c.toggle(Side::Incoming, 0);
+    assert_eq!(c.result, "a1\nb1\n", "still generated from the picks");
+
+    // After typing, picks add a line at the end and unpicks remove only that line.
+    c.edit("a1 and b1 merged by hand");
+    assert!(c.resolved);
+    c.toggle(Side::Current, 1);
+    assert_eq!(c.result, "a1 and b1 merged by hand\na2\n");
+    c.toggle(Side::Current, 1);
+    assert_eq!(c.result, "a1 and b1 merged by hand\n");
+    c.toggle(Side::Current, 0);
+    assert_eq!(c.result, "a1 and b1 merged by hand\n", "a line edited away has nothing to remove");
+    assert_eq!(doc.render(), "top\na1 and b1 merged by hand\n");
+
+    // Clearing the text is a valid resolution; reset returns to the markers.
+    nth_conflict(&mut doc, 0).edit("");
+    assert_eq!((doc.resolved(), doc.render().as_str()), (1, "top\n"));
+    nth_conflict(&mut doc, 0).reset();
+    assert!(doc.render().contains("<<<<<<< HEAD"));
+
+    // A whole-block choice replaces hand edits.
+    let c = nth_conflict(&mut doc, 0);
+    c.edit("junk");
+    c.take(Take::Both);
+    assert_eq!(c.result, "a1\na2\nb1\n");
+}
+
+#[test]
+fn conflict_editor_resolves_a_real_merge() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    let file = |two: &str, six: &str| format!("one\n{two}\nc1\nc2\nc3\nc4\nc5\n{six}\n");
+    commit(&repo, "f.txt", &file("two", "six"), "base");
+    commit(&repo, "gone.txt", "x\n", "another file");
+    op(&repo, branch("other", true));
+    commit(&repo, "f.txt", &file("TWO theirs", "SIX theirs"), "theirs");
+    g(&repo, &["rm", "-q", "gone.txt"]);
+    op(&repo, commit_op("theirs deletes"));
+    op(&repo, checkout("main"));
+    commit(&repo, "f.txt", &file("TWO ours", "SIX ours"), "ours");
+    commit(&repo, "gone.txt", "changed\n", "ours edits");
+    fails(&repo, merge("other", MergeMode::Default));
+
+    // Both sides are described for the conflict panel: branch, tip, commits on the file.
+    let (current, incoming) = git::conflict_sides(&repo, "f.txt");
+    assert_eq!((current.name.as_str(), incoming.name.as_str()), ("main", "other"));
+    let subjects = |side: &git::ConflictSide| side.commits.iter().map(|c| c.subject.clone()).collect::<Vec<_>>();
+    assert_eq!((subjects(&current), subjects(&incoming)), (vec!["ours".to_string()], vec!["theirs".to_string()]));
+    assert_eq!(current.tip.unwrap().subject, "ours edits");
+    assert_eq!(incoming.tip.unwrap().subject, "theirs deletes");
+
+    // A file one side deleted has no markers: the editor declines and says what to do.
+    assert!(conflict::load(&repo, "gone.txt").unwrap_err().contains("no conflict markers"));
+    assert!(conflict::load(&repo, "missing.txt").unwrap_err().contains("not in the work tree"));
+
+    let (original, mut doc) = conflict::load(&repo, "f.txt").unwrap();
+    assert_eq!(doc.total(), 2);
+    assert_eq!(doc.conflicts().next().unwrap().incoming_label, "other");
+    nth_conflict(&mut doc, 0).toggle(Side::Incoming, 0);
+    let second = nth_conflict(&mut doc, 1);
+    second.take(Take::Current);
+    second.edit("SIX merged by hand\n");
+    let resolved = file("TWO theirs", "SIX merged by hand");
+    assert_eq!(doc.render(), resolved);
+
+    // Never overwrite a file that changed on disk since it was opened.
+    write(&repo, "f.txt", "edited elsewhere\n");
+    assert!(conflict::save(&repo, "f.txt", &original, &doc.render()).unwrap_err().contains("changed on disk"));
+    assert_eq!(read(&repo, "f.txt"), "edited elsewhere\n");
+    write(&repo, "f.txt", &original);
+
+    conflict::save(&repo, "f.txt", &original, &doc.render()).unwrap();
+    assert_eq!(read(&repo, "f.txt"), resolved);
+    op(&repo, stage(&["f.txt"]));
+    op(&repo, Op::Resolve { change: conflict_of(&repo, "gone.txt"), theirs: true });
+    assert!(!git::status(&repo).iter().any(Change::conflicted));
+    op(&repo, Op::Continue(InProgress::Merge));
+
+    assert_eq!(git::in_progress(&repo), InProgress::None);
+    assert_eq!(git::conflict_sides(&repo, "f.txt").1.name, "Stash or patch", "no incoming commit once the merge is done");
+    assert_eq!(log(&repo)[0].parents.len(), 2);
+    assert_eq!(read(&repo, "f.txt"), resolved);
+    assert_eq!(g(&repo, &["show", "HEAD:f.txt"]) + "\n", resolved, "the merge commit holds the resolved text");
+    assert!(!repo.join("gone.txt").exists(), "taking the deleting side removes the file");
+    assert!(git::status(&repo).is_empty());
+}
+
+/// A merge that stops with every kind of conflict git reports, plus a binary one.
+/// Leaves the repo on `main`, mid-merge.
+fn every_conflict_kind(repo: &Path) {
+    let renamed = "a file that both sides rename\nkeeps enough lines\nto be detected\nas the same file\n";
+    for (file, text) in [("uu.txt", "base\n"), ("ud.txt", "base\n"), ("du.txt", "base\n"), ("bin.dat", "\0base"), ("ren.txt", renamed)] {
+        write(repo, file, text);
+    }
+    op(repo, Op::StageAll);
+    op(repo, commit_op("base"));
+    op(repo, branch("other", true));
+    for (file, text) in [("uu.txt", "theirs\n"), ("aa.txt", "theirs added\n"), ("du.txt", "theirs changed\n"), ("bin.dat", "\0theirs")] {
+        write(repo, file, text);
+    }
+    g(repo, &["rm", "-q", "ud.txt"]);
+    g(repo, &["mv", "ren.txt", "theirs-name.txt"]);
+    op(repo, Op::StageAll);
+    op(repo, commit_op("theirs"));
+    op(repo, checkout("main"));
+    for (file, text) in [("uu.txt", "ours\n"), ("aa.txt", "ours added\n"), ("ud.txt", "ours changed\n"), ("bin.dat", "\0ours")] {
+        write(repo, file, text);
+    }
+    g(repo, &["rm", "-q", "du.txt"]);
+    g(repo, &["mv", "ren.txt", "ours-name.txt"]);
+    op(repo, Op::StageAll);
+    op(repo, commit_op("ours"));
+    fails(repo, merge("other", MergeMode::Default));
+}
+
+#[test]
+fn every_conflict_kind_is_named_and_classified() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    every_conflict_kind(&repo);
+    let changes = git::status(&repo);
+    let kind = |path: &str| {
+        let found = change(&changes, path);
+        (format!("{}{}", found.index, found.work), found.conflict_reason(), conflict::file_state(&repo, found))
+    };
+    assert_eq!(kind("uu.txt"), ("UU".into(), "both modified", FileState::Text));
+    assert_eq!(kind("aa.txt"), ("AA".into(), "both added", FileState::Text));
+    assert_eq!(kind("bin.dat"), ("UU".into(), "both modified", FileState::Binary));
+    assert_eq!(kind("ud.txt"), ("UD".into(), "deleted by them", FileState::OneSided));
+    assert_eq!(kind("du.txt"), ("DU".into(), "deleted by us", FileState::OneSided));
+    assert_eq!(kind("ren.txt"), ("DD".into(), "both deleted", FileState::OneSided));
+    assert_eq!(kind("ours-name.txt"), ("AU".into(), "added by us", FileState::OneSided));
+    assert_eq!(kind("theirs-name.txt"), ("UA".into(), "added by them", FileState::OneSided));
+    assert_eq!(changes.iter().filter(|c| c.conflicted()).count(), 8);
+    assert_eq!(Change::default().conflict_reason(), "");
+
+    // The editor takes text conflicts only, and says why otherwise.
+    assert!(conflict::load(&repo, "uu.txt").is_ok());
+    assert!(conflict::load(&repo, "bin.dat").unwrap_err().contains("binary file"));
+    assert!(conflict::load(&repo, "ud.txt").unwrap_err().contains("no conflict markers"));
+    assert!(conflict::load(&repo, "ren.txt").unwrap_err().contains("not in the work tree"));
+
+    // Markers removed in another editor: nothing left to merge, only to stage.
+    write(&repo, "uu.txt", "fixed by hand\n");
+    assert_eq!(conflict::file_state(&repo, change(&changes, "uu.txt")), FileState::Resolved);
+}
+
+#[test]
+fn every_conflict_kind_resolves_to_either_side() {
+    for theirs in [false, true] {
+        let sb = Sandbox::new();
+        let repo = sb.repo("r");
+        every_conflict_kind(&repo);
+        for conflicted in git::status(&repo).into_iter().filter(|c| c.conflicted()) {
+            let deletes = conflicted.resolution_deletes(theirs);
+            op(&repo, Op::Resolve { change: conflicted.clone(), theirs });
+            assert_eq!(repo.join(&conflicted.path).exists(), !deletes, "{} with theirs={theirs}", conflicted.path);
+        }
+        assert!(!git::status(&repo).iter().any(Change::conflicted));
+        op(&repo, Op::Continue(InProgress::Merge));
+        assert_eq!((git::in_progress(&repo), log(&repo)[0].parents.len()), (InProgress::None, 2));
+        assert!(git::status(&repo).is_empty());
+
+        let exists = |file: &str| repo.join(file).exists();
+        let (kept, dropped) = if theirs { ("theirs-name.txt", "ours-name.txt") } else { ("ours-name.txt", "theirs-name.txt") };
+        assert!(exists(kept) && !exists(dropped) && !exists("ren.txt"), "rename conflict keeps one name (theirs={theirs})");
+        if theirs {
+            assert_eq!((read(&repo, "uu.txt"), read(&repo, "aa.txt"), read(&repo, "du.txt")), ("theirs\n".into(), "theirs added\n".into(), "theirs changed\n".into()));
+            assert_eq!(read(&repo, "bin.dat"), "\0theirs");
+            assert!(!exists("ud.txt"), "they deleted it");
+        } else {
+            assert_eq!((read(&repo, "uu.txt"), read(&repo, "aa.txt"), read(&repo, "ud.txt")), ("ours\n".into(), "ours added\n".into(), "ours changed\n".into()));
+            assert_eq!(read(&repo, "bin.dat"), "\0ours");
+            assert!(!exists("du.txt"), "we deleted it");
+        }
+    }
+}
+
+#[test]
+fn conflict_sides_follow_the_operation() {
+    let sb = Sandbox::new();
+    let tip = |side: &git::ConflictSide| side.tip.as_ref().map(|c| c.subject.clone()).unwrap_or_default();
+    let names = |repo: &Path| {
+        let (current, incoming) = git::conflict_sides(repo, "f.txt");
+        (current.name.clone(), tip(&current), incoming.name.clone(), tip(&incoming))
+    };
+    let own = |text: &str| text.to_string();
+
+    // Rebase: current is what we rebase onto, incoming is the commit being replayed.
+    let repo = sb.repo("rebase");
+    diverge(&repo);
+    fails(&repo, Op::Rebase { onto: "other".into(), autostash: false });
+    assert_eq!(names(&repo), (own("other"), own("theirs change"), own("main"), own("ours change")));
+    let (_, incoming) = git::conflict_sides(&repo, "f.txt");
+    assert_eq!(incoming.commits.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), ["ours change"]);
+    op(&repo, Op::Abort(InProgress::Rebase));
+
+    // Cherry-pick and revert: HEAD against the commit named by the operation.
+    fails(&repo, Op::CherryPick { sha: sha(&repo, "other"), mainline: false });
+    assert_eq!(names(&repo), (own("main"), own("ours change"), own("other"), own("theirs change")));
+    op(&repo, Op::Abort(InProgress::CherryPick));
+    commit(&repo, "f.txt", "ours again\n", "ours again");
+    fails(&repo, Op::Revert { sha: sha(&repo, "HEAD~1"), mainline: false });
+    assert_eq!(git::in_progress(&repo), InProgress::Revert);
+    assert_eq!(names(&repo).3, "ours change", "revert's incoming side is the commit being reverted");
+    op(&repo, Op::Abort(InProgress::Revert));
+
+    // A stash that no longer applies: a conflict with no operation in progress.
+    write(&repo, "f.txt", "stashed\n");
+    op(&repo, Op::StashPush { message: String::new(), include_untracked: false });
+    commit(&repo, "f.txt", "moved on\n", "moved on");
+    fails(&repo, Op::StashApply { name: "stash@{0}".into(), pop: true });
+    assert_eq!(git::in_progress(&repo), InProgress::None);
+    let stuck = conflict_of(&repo, "f.txt");
+    assert_eq!((stuck.conflict_reason(), conflict::file_state(&repo, &stuck)), ("both modified", FileState::Text));
+    assert_eq!(names(&repo), (own("main"), own("moved on"), own("Stash or patch"), String::new()));
+
+    // The editor still resolves it; there is nothing to continue afterwards.
+    let (original, mut doc) = conflict::load(&repo, "f.txt").unwrap();
+    doc.conflicts_mut().for_each(|c| c.take(Take::Incoming));
+    conflict::save(&repo, "f.txt", &original, &doc.render()).unwrap();
+    op(&repo, stage(&["f.txt"]));
+    assert_eq!(read(&repo, "f.txt"), "stashed\n");
+    assert!(!git::status(&repo).iter().any(Change::conflicted));
+    assert_eq!(git::stashes(&repo).len(), 1, "the stash is kept after a conflicting pop");
+}
+
+// ---------------------------------------------------------------- batches
+
+#[test]
+fn batch_runs_every_operation_and_reports_each_failure() {
+    let sb = Sandbox::new();
+    let (origin, repo) = sb.with_origin();
+    for name in ["merged-1", "merged-2"] {
+        op(&repo, branch(name, false));
+    }
+    op(&repo, branch("unmerged", true));
+    commit(&repo, "u.txt", "u\n", "only here");
+    op(&repo, checkout("main"));
+    let delete = |name: &str| Op::DeleteBranch { name: name.into(), force: false };
+    let ops = [delete("merged-1"), delete("unmerged"), delete("merged-2")];
+    let locals = |repo: &Path| git::branches(repo).into_iter().filter(|b| b.remote.is_none()).map(|b| b.name).collect::<Vec<_>>();
+
+    // Dependent steps stop at the first failure.
+    let stopped = git::run_ops(&repo, &ops, false);
+    assert!(!stopped.ok);
+    assert!(stopped.error.contains("unmerged") && !stopped.error.contains("failed:"), "{}", stopped.error);
+    assert_eq!(locals(&repo), ["main", "merged-2", "unmerged"]);
+
+    // A batch runs them all and names what failed.
+    op(&repo, branch("merged-1", false));
+    let batch = git::run_ops(&repo, &ops, true);
+    assert!(!batch.ok);
+    assert!(batch.error.starts_with("1 of 3 failed:\n"), "{}", batch.error);
+    assert!(batch.error.contains("unmerged"), "{}", batch.error);
+    assert_eq!(batch.log.matches("$ git branch -d").count(), 3);
+    assert_eq!(locals(&repo), ["main", "unmerged"], "the unmerged branch must survive a non-forced batch");
+
+    let forced = git::run_ops(&repo, &[Op::DeleteBranch { name: "unmerged".into(), force: true }], true);
+    assert!(forced.ok && forced.error.is_empty());
+    assert_eq!(locals(&repo), ["main"]);
+    assert!(git::run_ops(&repo, &[], true).ok);
+
+    // Tags.
+    for name in ["t1", "t2"] {
+        op(&repo, Op::CreateTag { name: name.into(), target: "HEAD".into(), message: String::new() });
+    }
+    let tag = |name: &str| Op::DeleteTag { name: name.into() };
+    let tags = git::run_ops(&repo, &[tag("t1"), tag("missing"), tag("t2")], true);
+    assert!(tags.error.starts_with("1 of 3 failed:") && tags.error.contains("missing"), "{}", tags.error);
+    assert!(git::tags(&repo).is_empty());
+
+    // Remote branches.
+    for name in ["x", "y"] {
+        op(&repo, branch(name, false));
+        op(&repo, push(name, false));
+    }
+    let remote = |name: &str| Op::DeleteRemoteBranch { remote: "origin".into(), name: name.into() };
+    let unreachable = Op::DeleteRemoteBranch { remote: "no-such-remote".into(), name: "x".into() };
+    let remotes = git::run_ops(&repo, &[remote("x"), unreachable, remote("y")], true);
+    assert!(remotes.error.starts_with("1 of 3 failed:") && remotes.error.contains("no-such-remote"), "{}", remotes.error);
+    assert_eq!(g(&origin, &["branch", "--format=%(refname:short)"]), "main");
+
+    // Worktrees: the dirty one survives unless forced.
+    let folder = |name: &str| sb.root.join(name).to_str().unwrap().replace('\\', "/");
+    for name in ["x", "y"] {
+        op(&repo, Op::WorktreeAdd { path: folder(&format!("wt-{name}")), target: name.into(), new_branch: None });
+    }
+    let paths: Vec<String> = git::worktrees(&repo).into_iter().filter(|t| !t.main).map(|t| t.path).collect();
+    write(Path::new(&paths[1]), "unsaved.txt", "precious\n");
+    let remove = |force| paths.iter().map(|p| Op::WorktreeRemove { path: p.clone(), force }).collect::<Vec<_>>();
+    let kept = git::run_ops(&repo, &remove(false), true);
+    assert!(kept.error.starts_with("1 of 2 failed:"), "{}", kept.error);
+    assert!(!Path::new(&paths[0]).exists());
+    assert_eq!(read(Path::new(&paths[1]), "unsaved.txt"), "precious\n");
+    assert!(git::run_ops(&repo, &remove(true)[1..], true).ok);
+    assert_eq!(git::worktrees(&repo).len(), 1);
+}
+
+#[test]
+fn sidebar_selection_toggles_and_extends() {
+    use crate::repo::apply_selection;
+    let order: Vec<String> = ["a", "b", "c", "d", "e"].map(String::from).to_vec();
+    let (mut marked, mut anchor) = (std::collections::BTreeSet::new(), None);
+    let click = |key: &str, shift: bool, marked: &mut std::collections::BTreeSet<String>, anchor: &mut Option<String>| {
+        apply_selection(marked, anchor, &order, key, shift);
+        marked.iter().map(String::as_str).collect::<String>()
+    };
+
+    // Ctrl toggles and moves the anchor.
+    assert_eq!(click("b", false, &mut marked, &mut anchor), "b");
+    assert_eq!(click("d", false, &mut marked, &mut anchor), "bd");
+    assert_eq!(click("d", false, &mut marked, &mut anchor), "b");
+    assert_eq!(anchor.as_deref(), Some("d"));
+
+    // Shift replaces the selection with the range from the anchor, in either direction.
+    assert_eq!(click("a", true, &mut marked, &mut anchor), "abcd");
+    assert_eq!(click("e", true, &mut marked, &mut anchor), "de");
+    assert_eq!(click("d", true, &mut marked, &mut anchor), "d");
+    assert_eq!(anchor.as_deref(), Some("d"), "a range does not move the anchor");
+
+    // Without a usable anchor, Shift behaves like a toggle.
+    (marked, anchor) = (Default::default(), None);
+    assert_eq!(click("c", true, &mut marked, &mut anchor), "c");
+    anchor = Some("filtered-out".into());
+    assert_eq!(click("a", true, &mut marked, &mut anchor), "ac");
+    assert_eq!(anchor.as_deref(), Some("a"));
+}
+
+#[test]
+fn branches_group_into_folders_by_prefix() {
+    use crate::repo::{TreeRow, tree_rows};
+    let names = ["main", "develop", "feat/anims/Value", "feat/anims/Animation", "feat/twin/x", "feat/workstation-setup", "backup/pre-split", "Hotfix-1.2.1", "feat/anims-rebase-a01"];
+    // Compact form: depth, then "+name" open folder, "-name" closed folder, or a branch's full name.
+    let show = |collapsed: &[&str], all_open: bool| -> Vec<String> {
+        let collapsed = collapsed.iter().map(|k| k.to_string()).collect();
+        tree_rows(&names, &collapsed, "local", all_open)
+            .iter()
+            .map(|row| match row {
+                TreeRow::Folder { name, depth, open, .. } => format!("{depth}{}{name}", if *open { '+' } else { '-' }),
+                TreeRow::Leaf { index, name, depth } => {
+                    assert!(names[*index].ends_with(name), "leaf name is the last part of the branch");
+                    format!("{depth} {}", names[*index])
+                }
+            })
+            .collect()
+    };
+
+    // Folders first, then branches, alphabetical without regard to case, nested by every '/'.
+    let expected = [
+        "0+backup", "1 backup/pre-split",
+        "0+feat", "1+anims", "2 feat/anims/Animation", "2 feat/anims/Value", "1+twin", "2 feat/twin/x", "1 feat/anims-rebase-a01", "1 feat/workstation-setup",
+        "0 develop", "0 Hotfix-1.2.1", "0 main",
+    ];
+    assert_eq!(show(&[], false), expected);
+
+    // A folded folder keeps its row and hides everything under it.
+    assert_eq!(show(&["local/feat"], false), ["0+backup", "1 backup/pre-split", "0-feat", "0 develop", "0 Hotfix-1.2.1", "0 main"]);
+    let nested = show(&["local/feat/anims"], false);
+    assert!(nested.contains(&"1-anims".to_string()) && nested.contains(&"2 feat/twin/x".to_string()) && !nested.iter().any(|r| r.contains("Animation")));
+    // Another tree's folders do not fold this one; filtering opens everything.
+    assert_eq!(show(&["remote/origin/feat"], false), expected);
+    assert_eq!(show(&["local/feat", "local/backup"], true), expected);
+
+    // Keys name the folder's full path, so equal names at different places fold apart.
+    let keys: Vec<String> = tree_rows(&names, &Default::default(), "remote/origin", false).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
+    assert_eq!(keys, ["remote/origin/backup", "remote/origin/feat", "remote/origin/feat/anims", "remote/origin/feat/twin"]);
+
+    // Odd names never loop or vanish: every branch still appears exactly once.
+    let odd = ["a//b", "/lead", "trail/", "//", "", "x/y/z/w"];
+    let mut seen: Vec<usize> = tree_rows(&odd, &Default::default(), "local", false).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
+    seen.sort();
+    assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
 }
 
 // ---------------------------------------------------------------- remotes
@@ -1000,6 +1580,10 @@ fn option_like_names_are_rejected_before_git_runs() {
         Op::AddRemote { name: evil(), url: ok() },
         Op::AddRemote { name: ok(), url: evil() },
         Op::RemoveRemote { name: evil() },
+        Op::WorktreeAdd { path: evil(), target: ok(), new_branch: None },
+        Op::WorktreeAdd { path: ok(), target: evil(), new_branch: None },
+        Op::WorktreeAdd { path: ok(), target: ok(), new_branch: Some(evil()) },
+        Op::WorktreeRemove { path: evil(), force: true },
         Op::Checkout { target: "  ".into() },
         Op::Checkout { target: "a\nb".into() },
     ];
@@ -1214,8 +1798,11 @@ fn parsers_handle_edge_cases() {
     assert!(git::parse_name_status("").is_empty());
     assert!(git::parse_commits("too\0few\0fields\n").is_empty());
 
-    let trees = git::parse_worktrees("worktree /a\nHEAD abc\nbranch refs/heads/main\n\nworktree /b\nHEAD def\ndetached\n");
-    assert_eq!(trees, [git::Worktree { path: "/a".into(), branch: "main".into() }, git::Worktree { path: "/b".into(), branch: "detached".into() }]);
+    let trees = git::parse_worktrees(
+        "worktree /a\nHEAD abc\nbranch refs/heads/main\n\nworktree /b\nHEAD def\ndetached\n\nworktree /c\nHEAD abc\nbranch refs/heads/x/y\nprunable gitdir file points to non-existent location\n",
+    );
+    let tree = |path: &str, branch: &str, main, prunable| git::Worktree { path: path.into(), branch: branch.into(), main, prunable };
+    assert_eq!(trees, [tree("/a", "main", true, false), tree("/b", "detached", false, false), tree("/c", "x/y", false, true)]);
     assert_eq!(git::short("0123456789abcdef"), "0123456789");
     assert_eq!(git::short("abc"), "abc");
 }

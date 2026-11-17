@@ -1,18 +1,21 @@
 //! One open repository: state, background work, and its three pages
 //! (history, local changes, stashes).
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui::epaint::{CubicBezierShape, QuadraticBezierShape};
-use eframe::egui::{self, Align, Align2, Color32, Context, Id, Key, Layout, Painter, Pos2, Rect, Response, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
+use eframe::egui::{self, Align, Align2, Color32, Context, Id, Key, Layout, Painter, Pos2, Rect, Response, ScrollArea, Sense, Stroke, Ui, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2};
 
+use crate::conflict::{self, FileState};
 use crate::dialogs::{self, Dialog, Outcome};
 use crate::diff::{self, Diff, LineKind};
-use crate::git::{self, Branch, Change, Commit, DiffSpec, InProgress, LogQuery, Op, OpResult, RefKind, SearchBy, Snapshot, Stash, short};
+use crate::git::{self, Branch, Change, Commit, ConflictSide, DiffSpec, InProgress, LogQuery, Op, OpResult, RefKind, SearchBy, Snapshot, Stash, short};
 use crate::graph::{self, DotKind, Graph};
+use crate::merge_editor::{Action, MergeEditor};
 use crate::theme::{self, Colors, shape};
 use crate::widgets::{self as w, Kind, ic};
 
@@ -26,6 +29,15 @@ enum Page {
     History,
     Changes,
     Stashes,
+}
+
+/// Kinds of sidebar rows that can be multi-selected. One kind at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum Group {
+    Local,
+    Remote,
+    Tag,
+    Worktree,
 }
 
 /// What the detail cards show: a commit or a stash.
@@ -45,6 +57,20 @@ enum Msg {
     Diff(u64, Diff),
     LastMessage(String),
     Text(String, String),
+    /// The conflict editor's file was written and staged (or that failed).
+    Resolved(OpResult),
+    /// What the conflict panel shows for a file.
+    Sides(String, ConflictInfo),
+    /// A background task panicked; details are in the crash log.
+    Crashed,
+}
+
+/// Both sides of the conflict over a file, and what can be done with the file.
+#[derive(Clone)]
+struct ConflictInfo {
+    current: ConflictSide,
+    incoming: ConflictSide,
+    state: FileState,
 }
 
 struct Notice {
@@ -75,6 +101,21 @@ pub struct RepoView {
     search_by: SearchBy,
     filter: String,
     open: [bool; 5],
+    /// The conflict editor, in its own window while a file is being resolved.
+    merge: Option<MergeEditor>,
+    /// After a file is resolved, open the next conflicted one when the snapshot arrives.
+    merge_next: bool,
+    /// The conflict panel's data for a file (its path first); `None` while loading.
+    sides: Option<(String, Option<ConflictInfo>)>,
+    /// The conflict panel's checkboxes: take current, take incoming.
+    take: (bool, bool),
+    /// Folded branch folders, by key: `local/feat/anims`, `remote/origin`, `remote/origin/fix`.
+    collapsed: BTreeSet<String>,
+    /// Multi-selected sidebar rows of `mark_group`: branch or tag names, worktree paths.
+    marked: BTreeSet<String>,
+    mark_group: Group,
+    /// Where a Shift-click range starts.
+    anchor: Option<String>,
     selected: Option<String>,
     scroll_to: Option<usize>,
     wanted: Option<String>,
@@ -128,6 +169,14 @@ impl RepoView {
             search_by: SearchBy::Message,
             filter: String::new(),
             open: [true, true, false, true, true],
+            merge: None,
+            merge_next: false,
+            sides: None,
+            take: (true, true),
+            collapsed: BTreeSet::new(),
+            marked: BTreeSet::new(),
+            mark_group: Group::Local,
+            anchor: None,
             selected: None,
             scroll_to: None,
             wanted: None,
@@ -159,7 +208,9 @@ impl RepoView {
     fn spawn(&self, ctx: &Context, work: impl FnOnce(&Path) -> Msg + Send + 'static) {
         let (tx, ctx, path) = (self.tx.clone(), ctx.clone(), self.path.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(work(&path)); // receiver gone = tab closed
+            // A panic here must not leave the UI waiting forever; the hook has logged it.
+            let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&path))).unwrap_or(Msg::Crashed);
+            let _ = tx.send(msg); // receiver gone = tab closed
             ctx.request_repaint();
         });
     }
@@ -182,7 +233,13 @@ impl RepoView {
         self.busy.is_some()
     }
 
+    /// Runs dependent steps: the first failure stops the rest.
     fn run(&mut self, ctx: &Context, ops: Vec<Op>) {
+        self.start(ctx, ops, false);
+    }
+
+    /// `keep_going`: the operations are independent (a batch), so run them all.
+    fn start(&mut self, ctx: &Context, ops: Vec<Op>, keep_going: bool) {
         let Some(first) = ops.first() else { return };
         if let Some(running) = self.busy {
             self.notify(format!("{running} is still running"), true, ctx);
@@ -190,19 +247,7 @@ impl RepoView {
         }
         let title = first.title();
         self.busy = Some(title);
-        self.spawn(ctx, move |repo| {
-            let mut total = OpResult { ok: true, ..Default::default() };
-            for op in &ops {
-                let result = git::run_op(repo, op);
-                total.log += &result.log;
-                if !result.ok {
-                    total.ok = false;
-                    total.error = result.error;
-                    break;
-                }
-            }
-            Msg::Done(title, total)
-        });
+        self.spawn(ctx, move |repo| Msg::Done(title, git::run_ops(repo, &ops, keep_going)));
     }
 
     fn notify(&mut self, text: String, error: bool, ctx: &Context) {
@@ -232,6 +277,19 @@ impl RepoView {
                 Msg::Diff(generation, diff) if generation == self.diff_generation => self.diff = Some(Arc::new(diff)),
                 Msg::LastMessage(message) if self.message.trim().is_empty() => self.message = message,
                 Msg::Text(title, text) => self.text_view = Some((title, text)),
+                Msg::Resolved(result) => self.on_resolved(ctx, result),
+                Msg::Sides(path, info) => {
+                    if let Some(editor) = self.merge.as_mut().filter(|e| e.path == path) {
+                        editor.set_sides((info.current.clone(), info.incoming.clone()));
+                    }
+                    if self.sides.as_ref().is_some_and(|(wanted, _)| wanted == &path) {
+                        self.sides = Some((path, Some(info)));
+                    }
+                }
+                Msg::Crashed => {
+                    (self.busy, self.loading) = (None, false);
+                    self.notify("Internal error in a background task. Details are in crash.log in Spoon's settings folder.".into(), true, ctx);
+                }
                 Msg::Detail(_) | Msg::Diff(..) | Msg::LastMessage(_) => {} // stale
             }
         }
@@ -240,7 +298,13 @@ impl RepoView {
     fn on_done(&mut self, ctx: &Context, title: &'static str, result: OpResult) {
         self.busy = None;
         self.log += &result.log;
-        if !result.ok {
+        let conflicts = result.log.lines().filter(|line| line.starts_with("CONFLICT")).count();
+        if !result.ok && conflicts > 0 {
+            // Not a failure: the operation waits for the conflicts to be settled.
+            let plural = if conflicts == 1 { "" } else { "s" };
+            self.notify(format!("{title} stopped on {conflicts} conflict{plural}. Resolve them here, then continue."), false, ctx);
+            self.enter(ctx, Page::Changes);
+        } else if !result.ok {
             self.notify(format!("{title} failed: {}", result.error.trim()), true, ctx);
         } else if matches!(title, "Fetch" | "Pull" | "Push" | "Commit") {
             self.notify(format!("{title} finished"), false, ctx);
@@ -253,8 +317,90 @@ impl RepoView {
         self.reload(ctx);
     }
 
+    /// Loads the conflict panel's data for a file. Data already shown for the same
+    /// file stays on screen until the fresh copy arrives.
+    fn load_sides(&mut self, ctx: &Context, change: &Change) {
+        if self.sides.as_ref().is_none_or(|(loaded, _)| loaded != &change.path) {
+            self.sides = Some((change.path.clone(), None));
+        }
+        let change = change.clone();
+        self.spawn(ctx, move |repo| {
+            let (current, incoming) = git::conflict_sides(repo, &change.path);
+            let state = conflict::file_state(repo, &change);
+            Msg::Sides(change.path, ConflictInfo { current, incoming, state })
+        });
+    }
+
+    fn merge_window_id(&self) -> ViewportId {
+        ViewportId::from_hash_of(("merge", &self.path))
+    }
+
+    fn open_conflict(&mut self, ctx: &Context, change: &Change) {
+        // One editor per repository: bring it forward rather than drop picked lines.
+        if let Some(open) = &self.merge {
+            ctx.send_viewport_cmd_to(self.merge_window_id(), ViewportCommand::Focus);
+            if open.path == change.path {
+                return;
+            }
+            if open.dirty() {
+                return self.notify(format!("Resolve or cancel {} first", open.path), false, ctx);
+            }
+        }
+        let known = self.sides.as_ref().filter(|(loaded, _)| loaded == &change.path).and_then(|(_, info)| info.clone());
+        let missing = known.is_none();
+        match MergeEditor::open(&self.path, &change.path, known.map(|info| (info.current, info.incoming))) {
+            Ok(editor) => self.merge = Some(editor),
+            Err(reason) => return self.notify(reason, true, ctx),
+        }
+        if missing {
+            self.load_sides(ctx, change);
+        }
+    }
+
+    /// Writes the editor's result and stages the file, which marks it resolved.
+    fn save_resolution(&mut self, ctx: &Context, content: String) {
+        let Some(editor) = &self.merge else { return };
+        if let Some(running) = self.busy {
+            self.notify(format!("{running} is still running"), true, ctx);
+            return;
+        }
+        let (path, original) = (editor.path.clone(), editor.original.clone());
+        self.busy = Some("Resolve conflict");
+        self.spawn(ctx, move |repo| {
+            Msg::Resolved(match conflict::save(repo, &path, &original, &content) {
+                Ok(()) => git::run_op(repo, &Op::Stage { paths: vec![path] }),
+                Err(error) => OpResult { ok: false, log: format!("Resolve conflict: {error}\n"), error },
+            })
+        });
+    }
+
+    fn on_resolved(&mut self, ctx: &Context, result: OpResult) {
+        self.busy = None;
+        self.log += &result.log;
+        if result.ok {
+            // The editor stays until the snapshot arrives, so its window is reused for the next file.
+            self.merge_next = true;
+            self.page = Page::Changes;
+        } else {
+            self.notify(format!("Resolve conflict failed: {}", result.error.trim()), true, ctx);
+        }
+        self.loading = false;
+        self.reload(ctx);
+    }
+
     fn on_snapshot(&mut self, ctx: &Context, snap: Snapshot, graph: Graph) {
         self.loading = false;
+        // The editor follows the repository: close it when its file is no longer in
+        // conflict (aborted, resolved elsewhere), move on after resolving one here.
+        if self.merge.as_ref().is_some_and(|editor| !snap.changes.iter().any(|c| c.conflicted() && c.path == editor.path)) {
+            self.merge = None;
+        }
+        if std::mem::take(&mut self.merge_next) {
+            match snap.changes.iter().find(|c| c.conflicted()) {
+                Some(next) => self.open_conflict(ctx, next),
+                None => self.notify(format!("All conflicts resolved. Continue the {}.", snap.state.label().to_lowercase()), false, ctx),
+            }
+        }
         if let Some((path, staged)) = self.picked.clone() {
             let still = snap.changes.iter().find(|c| c.path == path && if staged { c.staged() } else { c.unstaged() }).cloned();
             match still {
@@ -274,6 +420,13 @@ impl RepoView {
                 self.clear_detail();
             }
         }
+        let group = self.mark_group;
+        self.marked.retain(|key| match group {
+            Group::Local => snap.branches.iter().any(|b| b.remote.is_none() && &b.name == key),
+            Group::Remote => snap.branches.iter().any(|b| b.remote.is_some() && &b.name == key),
+            Group::Tag => snap.tags.iter().any(|t| &t.name == key),
+            Group::Worktree => snap.worktrees.iter().any(|t| &t.path == key),
+        });
         self.snap = Some(Arc::new(snap));
         self.graph = Arc::new(graph);
     }
@@ -333,6 +486,16 @@ impl RepoView {
 
     fn pick_change(&mut self, ctx: &Context, change: &Change, staged: bool) {
         self.picked = Some((change.path.clone(), staged));
+        if change.conflicted() {
+            // The conflict panel takes the diff's place; it shows both sides' history.
+            // Reloaded on every refresh: the file may have been fixed in another editor.
+            self.clear_diff();
+            if self.sides.as_ref().is_none_or(|(loaded, _)| loaded != &change.path) {
+                self.take = (true, true);
+            }
+            self.load_sides(ctx, change);
+            return;
+        }
         let spec = if staged { DiffSpec::Staged(change.clone()) } else { DiffSpec::Unstaged(change.clone()) };
         self.show_diff(ctx, spec, change.path.clone());
     }
@@ -395,10 +558,40 @@ impl RepoView {
 
     // ------------------------------------------------------------ layout
 
+    /// The conflict editor's window. Called for every open repository, not only the
+    /// active tab, so switching tabs does not close it.
+    pub fn merge_window(&mut self, ctx: &Context) {
+        let Some(mut editor) = self.merge.take() else { return };
+        // Saved and waiting for the snapshot counts as busy: the file on disk already changed.
+        let busy = self.busy.is_some() || self.merge_next;
+        let builder = ViewportBuilder::default()
+            .with_title(format!("{} - Merge - Spoon", editor.path))
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([760.0, 520.0])
+            .with_icon(crate::window_icon());
+        let action = ctx.show_viewport_immediate(self.merge_window_id(), builder, |ui, _| {
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0.0, w::colors(ui).surface_container);
+            let action = editor.ui(ui, rect, busy);
+            // Errors from saving belong where the user is looking.
+            self.snackbar(ui.ctx());
+            action
+        });
+        self.merge = Some(editor);
+        match action {
+            Action::Save(content) => self.save_resolution(ctx, content),
+            Action::Close => self.merge = None,
+            Action::Stay => {}
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, rect: Rect) {
         let ctx = ui.ctx().clone();
         if ui.input(|i| i.key_pressed(Key::F5)) {
             self.reload(&ctx);
+        }
+        if self.dialog.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) {
+            self.marked.clear();
         }
         let Some(snap) = self.snap.clone() else {
             w::loading_indicator(ui, rect.center(), 26.0);
@@ -512,7 +705,14 @@ impl RepoView {
         let c = w::colors(ui);
         let ctx = ui.ctx().clone();
         w::card(ui, rect, c.surface, CARD);
-        w::child(ui, "sidebar", rect.shrink(10.0), |ui| {
+        let inner = rect.shrink(10.0);
+        // A selection bar takes the bottom of the card while rows are marked.
+        let bar = if self.marked.is_empty() { 0.0 } else { 48.0 };
+        if bar > 0.0 {
+            self.selection_bar(ui, Rect::from_min_max(pos2(inner.left(), inner.bottom() - bar), inner.max), &ctx, snap);
+        }
+        let list = Rect::from_min_max(inner.min, inner.max - vec2(0.0, if bar > 0.0 { bar + 8.0 } else { 0.0 }));
+        w::child(ui, "sidebar", list, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
             let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 68.0), Sense::hover());
             let p = ui.painter().clone();
@@ -536,33 +736,63 @@ impl RepoView {
         let needle = self.filter.to_lowercase();
         let shown = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
 
+        // While filtering, every folder is shown open so matches are not hidden.
+        let filtering = !needle.is_empty();
+        let leaves = |rows: &[TreeRow], names: &[&Branch]| -> Vec<String> {
+            rows.iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(names[*index].name.clone()) } else { None }).collect()
+        };
+
         let locals: Vec<&Branch> = snap.branches.iter().filter(|b| b.remote.is_none() && shown(&b.name)).collect();
         if w::section_header(ui, "Branches", locals.len(), Some(&mut self.open[0]), Some((ic::ADD, "New branch"))) {
             self.dialog = Some(dialogs::create_branch("HEAD".into(), "the current commit"));
         }
-        for branch in locals.iter().take(visible(self.open[0])) {
-            let track = match (branch.gone, branch.ahead, branch.behind) {
-                (true, ..) => "gone".to_string(),
-                (_, 0, 0) => String::new(),
-                (_, a, 0) => format!("\u{2191}{a}"),
-                (_, 0, b) => format!("\u{2193}{b}"),
-                (_, a, b) => format!("\u{2191}{a} \u{2193}{b}"),
-            };
-            let (icon, tint) = if branch.current { (ic::CHECK_CIRCLE, c.primary) } else { (ic::BRANCH, c.on_surface_variant) };
-            let resp = side_row(ui, c, 0, icon, tint, &branch.name, branch.current, &track);
-            if resp.double_clicked() && !branch.current {
-                self.run(ctx, vec![Op::Checkout { target: branch.name.clone() }]);
-            } else if resp.clicked() {
-                self.jump_to(ctx, snap, &branch.sha);
+        let names: Vec<&str> = locals.iter().map(|b| b.name.as_str()).collect();
+        let rows = tree_rows(&names, &self.collapsed, "local", filtering);
+        let order = leaves(&rows, &locals);
+        for row in rows.iter().take(visible(self.open[0])) {
+            match row {
+                TreeRow::Leaf { index, name, depth } => self.local_branch_row(ui, ctx, snap, c, locals[*index], name, *depth, &order),
+                TreeRow::Folder { key, name, depth, open } => {
+                    let inside: Vec<&Branch> = folder_members(key, "local", &names).into_iter().map(|i| locals[i]).collect();
+                    let holds_current = inside.iter().any(|b| b.current);
+                    let members = inside.iter().map(|b| b.name.clone()).collect();
+                    self.folder_row(ui, c, key, name, *depth, *open, Group::Local, members, holds_current);
+                }
             }
-            resp.context_menu(|ui| self.local_branch_menu(ui, ctx, snap, branch));
         }
 
         if w::section_header(ui, "Remotes", snap.remotes.len(), Some(&mut self.open[1]), Some((ic::ADD, "Add remote"))) {
             self.dialog = Some(dialogs::add_remote(snap.remotes.is_empty()));
         }
-        for remote in snap.remotes.iter().take(visible(self.open[1])) {
-            let resp = side_row(ui, c, 0, ic::CLOUD, c.on_surface_variant, &remote.name, true, "");
+        // Every remote is a folder of its own. All trees are built first, so a
+        // Shift-click range can run across remotes.
+        struct RemoteTree<'a> {
+            remote: &'a git::Remote,
+            key: String,
+            open: bool,
+            branches: Vec<&'a Branch>,
+            short: Vec<&'a str>,
+            rows: Vec<TreeRow<'a>>,
+        }
+        let trees: Vec<RemoteTree> = snap
+            .remotes
+            .iter()
+            .map(|remote| {
+                let key = format!("remote/{}", remote.name);
+                let open = filtering || !self.collapsed.contains(&key);
+                let branches: Vec<&Branch> = snap.branches.iter().filter(|b| b.remote.as_deref() == Some(&remote.name) && shown(&b.name)).collect();
+                let short: Vec<&str> = branches.iter().map(|b| b.name.get(remote.name.len() + 1..).unwrap_or(&b.name)).collect();
+                let rows = if open { tree_rows(&short, &self.collapsed, &key, filtering) } else { Vec::new() };
+                RemoteTree { remote, key, open, branches, short, rows }
+            })
+            .collect();
+        let order: Vec<String> = trees.iter().flat_map(|tree| leaves(&tree.rows, &tree.branches)).collect();
+        for tree in trees.iter().take(visible(self.open[1])) {
+            let remote = tree.remote;
+            let resp = fold_row(ui, c, 0, ic::CLOUD, c.on_surface_variant, &remote.name, true, tree.open, Trail::Text(""));
+            if resp.clicked() {
+                toggle(&mut self.collapsed, &tree.key);
+            }
             resp.context_menu(|ui| {
                 if w::menu_item(ui, ic::FETCH, "Fetch") {
                     self.run(ctx, vec![Op::Fetch { remote: Some(remote.name.clone()), prune: true }]);
@@ -575,28 +805,31 @@ impl RepoView {
                     self.dialog = Some(dialogs::remove_remote(remote.name.clone()));
                 }
             });
-            let prefix = format!("{}/", remote.name);
-            for branch in snap.branches.iter().filter(|b| b.remote.as_deref() == Some(&remote.name) && shown(&b.name)) {
-                let label = branch.name.strip_prefix(&prefix).unwrap_or(&branch.name);
-                let resp = side_row(ui, c, 1, ic::BRANCH, c.on_surface_variant, label, false, "");
-                if resp.double_clicked() {
-                    self.dialog = Some(dialogs::checkout_remote(branch.name.clone(), &remote.name));
-                } else if resp.clicked() {
-                    self.jump_to(ctx, snap, &branch.sha);
+            for row in &tree.rows {
+                match row {
+                    TreeRow::Leaf { index, name, depth } => self.remote_branch_row(ui, ctx, snap, c, tree.branches[*index], name, depth + 1, &order, &remote.name),
+                    TreeRow::Folder { key, name, depth, open } => {
+                        let members = folder_members(key, &tree.key, &tree.short).into_iter().map(|i| tree.branches[i].name.clone()).collect();
+                        self.folder_row(ui, c, key, name, depth + 1, *open, Group::Remote, members, false);
+                    }
                 }
-                resp.context_menu(|ui| self.remote_branch_menu(ui, ctx, snap, branch, &remote.name));
             }
         }
 
         // ponytail: plain (non-virtualised) rows; cap the tag list, raise or virtualise if repos need more.
         let tags: Vec<&git::Tag> = snap.tags.iter().filter(|t| shown(&t.name)).take(300).collect();
         w::section_header(ui, "Tags", snap.tags.len(), Some(&mut self.open[2]), None);
+        let order: Vec<String> = tags.iter().map(|t| t.name.clone()).collect();
         for tag in tags.iter().take(visible(self.open[2])) {
-            let resp = side_row(ui, c, 0, ic::TAG, c.on_surface_variant, &tag.name, false, "");
-            if resp.clicked() {
+            let marked = self.is_marked(Group::Tag, &tag.name);
+            let resp = side_row(ui, c, 0, ic::TAG, c.on_surface_variant, &tag.name, false, marked, Trail::Text(""));
+            if resp.clicked() && !self.mark(ui, Group::Tag, &order, &tag.name) {
                 self.jump_to(ctx, snap, &tag.sha);
             }
-            resp.context_menu(|ui| self.tag_menu(ui, ctx, snap, tag));
+            resp.context_menu(|ui| match self.in_batch(Group::Tag, &tag.name) {
+                true => self.batch_menu(ui, ctx, snap),
+                false => self.tag_menu(ui, ctx, snap, tag),
+            });
         }
 
         if !snap.submodules.is_empty() {
@@ -604,7 +837,7 @@ impl RepoView {
                 self.run(ctx, vec![Op::SubmoduleUpdate]);
             }
             for module in snap.submodules.iter().take(visible(self.open[3])) {
-                let resp = side_row(ui, c, 0, ic::SUBMODULE, c.on_surface_variant, module, false, "");
+                let resp = side_row(ui, c, 0, ic::SUBMODULE, c.on_surface_variant, module, false, false, Trail::Text(""));
                 if resp.double_clicked() {
                     self.open_request = Some(self.path.join(module));
                 }
@@ -612,15 +845,223 @@ impl RepoView {
             }
         }
 
-        if snap.worktrees.len() > 1 {
-            w::section_header(ui, "Worktrees", snap.worktrees.len(), Some(&mut self.open[4]), None);
-            for tree in snap.worktrees.iter().take(visible(self.open[4])) {
-                let (_, name) = split_path(&tree.path);
-                let resp = side_row(ui, c, 0, ic::WORKTREE, c.on_surface_variant, name, false, &tree.branch);
-                if resp.double_clicked() {
-                    self.open_request = Some(PathBuf::from(&tree.path));
+        if w::section_header(ui, "Worktrees", snap.worktrees.len(), Some(&mut self.open[4]), Some((ic::ADD, "Add worktree"))) {
+            self.dialog = Some(dialogs::add_worktree(&self.path, None));
+        }
+        let order: Vec<String> = snap.worktrees.iter().map(|t| t.path.clone()).collect();
+        for tree in snap.worktrees.iter().take(visible(self.open[4])) {
+            let (_, name) = split_path(&tree.path);
+            let here = Path::new(&tree.path) == self.path;
+            let (trail, tip) = if tree.prunable {
+                (Trail::Icon(ic::WARNING, c.error), format!("{}\nFolder is missing. Prune to drop this entry.", tree.path))
+            } else {
+                (Trail::Text(&tree.branch), tree.path.clone())
+            };
+            let tint = if here { c.primary } else { c.on_surface_variant };
+            let marked = self.is_marked(Group::Worktree, &tree.path);
+            let resp = side_row(ui, c, 0, ic::WORKTREE, tint, name, here, marked, trail);
+            let marking = resp.clicked() && self.mark(ui, Group::Worktree, &order, &tree.path);
+            if !marking && resp.double_clicked() && !here && !tree.prunable {
+                self.open_request = Some(PathBuf::from(&tree.path));
+            }
+            resp.on_hover_text(tip).context_menu(|ui| match self.in_batch(Group::Worktree, &tree.path) {
+                true => self.batch_menu(ui, ctx, snap),
+                false => self.worktree_menu(ui, ctx, tree, here),
+            });
+        }
+    }
+
+    // ------------------------------------------------------------ multi-select
+
+    fn is_marked(&self, group: Group, key: &str) -> bool {
+        self.mark_group == group && self.marked.contains(key)
+    }
+
+    /// The row is part of a selection of several: its context menu acts on all of them.
+    fn in_batch(&self, group: Group, key: &str) -> bool {
+        self.marked.len() > 1 && self.is_marked(group, key)
+    }
+
+    /// Handles a click on a sidebar row. Ctrl toggles the row, Shift extends from the
+    /// last toggled row. Returns true when the click only changed the selection.
+    fn mark(&mut self, ui: &Ui, group: Group, order: &[String], key: &str) -> bool {
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+        if !ctrl && !shift {
+            self.marked.clear();
+            return false;
+        }
+        if self.mark_group != group {
+            // One kind at a time, so a batch action always has one meaning.
+            self.marked.clear();
+            self.anchor = None;
+            self.mark_group = group;
+        }
+        apply_selection(&mut self.marked, &mut self.anchor, order, key, shift);
+        true
+    }
+
+    fn batch_words(&self) -> (&'static str, &'static str) {
+        match self.mark_group {
+            Group::Local => ("Delete", "branches"),
+            Group::Remote => ("Delete", "remote branches"),
+            Group::Tag => ("Delete", "tags"),
+            Group::Worktree => ("Remove", "worktrees"),
+        }
+    }
+
+    fn batch_menu(&mut self, ui: &mut Ui, ctx: &Context, snap: &Snapshot) {
+        let (verb, noun) = self.batch_words();
+        if w::menu_danger(ui, ic::DELETE, &format!("{verb} {} {noun}\u{2026}", self.marked.len())) {
+            self.delete_marked(ctx, snap);
+        }
+        if w::menu_item(ui, ic::COPY, "Copy names") {
+            ctx.copy_text(self.marked.iter().cloned().collect::<Vec<_>>().join("\n"));
+        }
+        if w::menu_item(ui, ic::CLOSE, "Clear selection") {
+            self.marked.clear();
+        }
+    }
+
+    fn selection_bar(&mut self, ui: &mut Ui, rect: Rect, ctx: &Context, snap: &Snapshot) {
+        let c = w::colors(ui);
+        w::card(ui, rect, c.secondary_container, rect.height() / 2.0);
+        let (verb, noun) = self.batch_words();
+        w::hchild(ui, "selection-bar", rect.shrink2(vec2(6.0, 0.0)), |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if w::icon_btn(ic::CLOSE, "Clear selection (Esc)").size(36.0).show(ui).clicked() {
+                self.marked.clear();
+            }
+            let count = format!("{} {noun}", self.marked.len());
+            ui.label(egui::RichText::new(count).font(theme::emph(13.5)).color(c.on_secondary_container));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::btn(verb).icon(ic::DELETE).kind(Kind::Danger).height(36.0).show(ui).clicked() {
+                    self.delete_marked(ctx, snap);
                 }
-                resp.on_hover_text(&tree.path);
+            });
+        });
+    }
+
+    /// Asks to delete everything marked. Items that can never go (the current branch,
+    /// the main or current worktree) are left out, and the dialog says so.
+    fn delete_marked(&mut self, ctx: &Context, snap: &Snapshot) {
+        let group = self.mark_group;
+        let fixed = |key: &String| match group {
+            Group::Local => snap.branches.iter().any(|b| b.remote.is_none() && b.current && &b.name == key),
+            Group::Worktree => snap.worktrees.iter().any(|t| &t.path == key && (t.main || Path::new(&t.path) == self.path)),
+            Group::Remote | Group::Tag => false,
+        };
+        let names: Vec<String> = self.marked.iter().filter(|key| !fixed(key)).cloned().collect();
+        let skipped = self.marked.len() - names.len();
+        if names.is_empty() {
+            self.notify("Nothing in the selection can be removed: it is checked out here".into(), true, ctx);
+            return;
+        }
+        let (verb, noun) = self.batch_words();
+        let mut shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+        if names.len() > shown.len() {
+            shown.push("\u{2026}");
+        }
+        let mut body = format!("{verb} {} {noun}?\n\n{}", names.len(), shown.join("\n"));
+        body += match group {
+            Group::Remote => "\n\nEveryone using the remote loses them.",
+            Group::Worktree => "\n\nThe folders are deleted. Branches and commits stay.",
+            Group::Local | Group::Tag => "",
+        };
+        if skipped > 0 {
+            body += "\n\nLeft out: what is checked out in this window.";
+        }
+        let (title, force) = match group {
+            Group::Local => ("Delete branches", Some("Force: delete even if not merged")),
+            Group::Remote => ("Delete remote branches", None),
+            Group::Tag => ("Delete tags", None),
+            Group::Worktree => ("Remove worktrees", Some("Force: also discard uncommitted changes there")),
+        };
+        let remotes: Vec<String> = snap.remotes.iter().map(|r| r.name.clone()).collect();
+        self.dialog = Some(dialogs::batch(title, body, force, verb, move |force| {
+            names.iter().filter_map(|name| batch_op(group, name, &remotes, force)).collect()
+        }));
+    }
+
+    /// A foldable folder of branches. A click folds it; its menu selects what is inside.
+    /// A closed folder holding the current branch is highlighted, so it is not lost.
+    #[allow(clippy::too_many_arguments)]
+    fn folder_row(&mut self, ui: &mut Ui, c: &Colors, key: &str, name: &str, depth: usize, open: bool, group: Group, members: Vec<String>, holds_current: bool) {
+        let count = members.len().to_string();
+        let hides_current = holds_current && !open;
+        let (icon, tint) = (if open { ic::FOLDER_OPEN } else { ic::FOLDER }, if hides_current { c.primary } else { c.on_surface_variant });
+        let resp = fold_row(ui, c, depth, icon, tint, name, hides_current, open, Trail::Text(if open { "" } else { &count }));
+        if resp.clicked() {
+            toggle(&mut self.collapsed, key);
+        }
+        resp.context_menu(|ui| {
+            if w::menu_item(ui, ic::STAGE_ALL, &format!("Select all {} inside", members.len())) {
+                (self.mark_group, self.anchor) = (group, None);
+                self.marked = members.iter().cloned().collect();
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn local_branch_row(&mut self, ui: &mut Ui, ctx: &Context, snap: &Snapshot, c: &Colors, branch: &Branch, label: &str, depth: usize, order: &[String]) {
+        let track = match (branch.ahead, branch.behind) {
+            (0, 0) => String::new(),
+            (a, 0) => format!("\u{2191}{a}"),
+            (0, b) => format!("\u{2193}{b}"),
+            (a, b) => format!("\u{2191}{a} \u{2193}{b}"),
+        };
+        let trail = if branch.gone { Trail::Icon(ic::UPSTREAM_GONE, c.error) } else { Trail::Text(&track) };
+        let (icon, tint) = if branch.current { (ic::CHECK_CIRCLE, c.primary) } else { (ic::BRANCH, c.on_surface_variant) };
+        let marked = self.is_marked(Group::Local, &branch.name);
+        let resp = side_row(ui, c, depth, icon, tint, label, branch.current, marked, trail);
+        // Inside a folder the row shows only the last part of the name.
+        let resp = match (branch.gone, depth > 0) {
+            (true, _) => resp.on_hover_text(format!("{}\nUpstream branch no longer exists on the remote", branch.name)),
+            (false, true) => resp.on_hover_text(&branch.name),
+            (false, false) => resp,
+        };
+        let marking = resp.clicked() && self.mark(ui, Group::Local, order, &branch.name);
+        if !marking && resp.double_clicked() && !branch.current {
+            self.run(ctx, vec![Op::Checkout { target: branch.name.clone() }]);
+        } else if !marking && resp.clicked() {
+            self.jump_to(ctx, snap, &branch.sha);
+        }
+        resp.context_menu(|ui| match self.in_batch(Group::Local, &branch.name) {
+            true => self.batch_menu(ui, ctx, snap),
+            false => self.local_branch_menu(ui, ctx, snap, branch),
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn remote_branch_row(&mut self, ui: &mut Ui, ctx: &Context, snap: &Snapshot, c: &Colors, branch: &Branch, label: &str, depth: usize, order: &[String], remote: &str) {
+        let marked = self.is_marked(Group::Remote, &branch.name);
+        let resp = side_row(ui, c, depth, ic::BRANCH, c.on_surface_variant, label, false, marked, Trail::Text("")).on_hover_text(&branch.name);
+        let marking = resp.clicked() && self.mark(ui, Group::Remote, order, &branch.name);
+        if !marking && resp.double_clicked() {
+            self.dialog = Some(dialogs::checkout_remote(branch.name.clone(), remote));
+        } else if !marking && resp.clicked() {
+            self.jump_to(ctx, snap, &branch.sha);
+        }
+        resp.context_menu(|ui| match self.in_batch(Group::Remote, &branch.name) {
+            true => self.batch_menu(ui, ctx, snap),
+            false => self.remote_branch_menu(ui, ctx, snap, branch, remote),
+        });
+    }
+
+    fn worktree_menu(&mut self, ui: &mut Ui, ctx: &Context, tree: &git::Worktree, here: bool) {
+        if !here && !tree.prunable && w::menu_item(ui, ic::FOLDER_OPEN, "Open in new tab") {
+            self.open_request = Some(PathBuf::from(&tree.path));
+        }
+        if w::menu_item(ui, ic::COPY, "Copy path") {
+            ctx.copy_text(tree.path.clone());
+        }
+        if w::menu_item(ui, ic::REFRESH, "Prune stale worktrees") {
+            self.run(ctx, vec![Op::WorktreePrune]);
+        }
+        // The main work tree and the one this tab shows cannot be removed from here.
+        if !tree.main && !here {
+            w::menu_separator(ui);
+            if w::menu_danger(ui, ic::DELETE, "Remove worktree\u{2026}") {
+                self.dialog = Some(dialogs::remove_worktree(tree));
             }
         }
     }
@@ -636,6 +1077,9 @@ impl RepoView {
             }
             if w::menu_item(ui, ic::REBASE, "Rebase current branch onto this\u{2026}") {
                 self.ask(dialogs::rebase(snap, name.clone()), ctx);
+            }
+            if w::menu_item(ui, ic::WORKTREE, "Check out in a new worktree\u{2026}") {
+                self.dialog = Some(dialogs::add_worktree(&self.path, Some(&name)));
             }
         } else {
             if w::menu_item(ui, ic::PULL, "Pull\u{2026}") {
@@ -998,7 +1442,11 @@ impl RepoView {
         let commit_h = 178.0;
         let diff = Rect::from_min_max(right.min, pos2(right.right(), right.bottom() - commit_h - GAP));
         let commit = Rect::from_min_max(pos2(right.left(), diff.bottom() + GAP), right.max);
-        self.diff_card(ui, diff);
+        let conflicted = self.picked.as_ref().and_then(|(path, staged)| snap.changes.iter().find(|ch| !staged && ch.conflicted() && &ch.path == path)).cloned();
+        match conflicted {
+            Some(change) => self.conflict_panel(ui, diff, snap, &change),
+            None => self.diff_card(ui, diff),
+        }
 
         w::card(ui, commit, c.surface, CARD);
         let inner = commit.shrink(10.0);
@@ -1034,20 +1482,124 @@ impl RepoView {
         });
     }
 
+    /// Shown instead of a diff for a conflicted file: both sides with the commits that
+    /// touched the file, a checkbox each, and one button whose meaning follows the
+    /// ticks and what kind of conflict it is.
+    fn conflict_panel(&mut self, ui: &mut Ui, rect: Rect, snap: &Snapshot, change: &Change) {
+        let c = w::colors(ui);
+        let ctx = ui.ctx().clone();
+        w::card(ui, rect, c.surface, CARD);
+        let p = ui.painter().with_clip_rect(rect);
+        let cx = rect.center().x;
+        let top = rect.top() + (rect.height() * 0.05).clamp(16.0, 40.0);
+        let operation = snap.state.label();
+        let heading = if operation.is_empty() { "Conflict".to_string() } else { format!("{operation} conflict") };
+        let title = p.text(pos2(cx + 14.0, top + 12.0), Align2::CENTER_CENTER, heading, theme::emph(20.0), c.on_surface);
+        w::icon_at(&p, pos2(title.left() - 20.0, top + 12.0), ic::WARNING, 24.0, c.tertiary);
+        p.text(pos2(cx, top + 40.0), Align2::CENTER_CENTER, "Select the changes or merge them manually", theme::body(13.5), c.on_surface_variant);
+        let file = p.text(pos2(cx + 10.0, top + 70.0), Align2::CENTER_CENTER, &change.path, theme::body(14.5), c.on_surface);
+        w::icon_at(&p, pos2(file.left() - 14.0, top + 70.0), ic::FILE, 16.0, c.on_surface_variant);
+        let kind = format!("{}{}  {}", change.index, change.work, change.conflict_reason());
+        let kind_width = w::text_width(&p, &kind, theme::emph(11.5)) + 30.0;
+        w::chip(&p, pos2(cx - kind_width / 2.0, top + 98.0), ic::WARNING, &kind, c.error_container, c.on_error_container);
+
+        let info = self.sides.as_ref().filter(|(path, _)| path == &change.path).and_then(|(_, info)| info.as_ref());
+        let gap = 132.0;
+        let width = ((rect.width() - gap - 48.0) / 2.0).clamp(180.0, 330.0);
+        let cards_top = top + 126.0;
+        // Tall enough for the longer commit list, within what the card leaves free.
+        let commits = info.map_or(1, |i| i.current.commits.len().max(i.incoming.commits.len()).max(1));
+        let height = (64.0 + commits as f32 * 22.0).min((rect.bottom() - cards_top - 118.0).clamp(90.0, 236.0));
+        let left = Rect::from_min_size(pos2(cx - gap / 2.0 - width, cards_top), vec2(width, height));
+        let right = Rect::from_min_size(pos2(cx + gap / 2.0, cards_top), vec2(width, height));
+        // What each side did to the file: a 'U' next to an 'A' means that side lacks it.
+        let status = |own: char, other: char| match (own, other) {
+            ('A', _) => ('A', "added"),
+            ('D', _) => ('D', "deleted"),
+            ('U', 'A') => ('D', "not present"),
+            _ => ('M', "modified"),
+        };
+        let names = (info.map_or_else(|| snap.head.label(), |i| i.current.name.clone()), info.map_or_else(|| "incoming".to_string(), |i| i.incoming.name.clone()));
+        side_card(ui, &c, left, info.map(|i| &i.current), &names.0, c.primary, self.take.0, status(change.index, change.work));
+        side_card(ui, &c, right, info.map(|i| &i.incoming), &names.1, c.tertiary, self.take.1, status(change.work, change.index));
+
+        // Checkboxes between the cards, joined to each other and to the button below.
+        let y = cards_top + 24.0;
+        let (box_left, box_right) = (pos2(left.right() + 24.0, y), pos2(right.left() - 24.0, y));
+        let button_y = cards_top + height + 40.0;
+        let line = |on: bool, color| Stroke::new(1.5, if on { color } else { c.outline_variant });
+        p.line_segment([box_left + vec2(16.0, 0.0), pos2(cx, y)], line(self.take.0, c.primary));
+        p.line_segment([pos2(cx, y), box_right - vec2(16.0, 0.0)], line(self.take.1, c.tertiary));
+        p.line_segment([pos2(cx, y), pos2(cx, button_y - 26.0)], line(self.take.0 || self.take.1, c.on_surface_variant));
+        let check = |on: bool| if on { w::Check::On } else { w::Check::Off };
+        if w::checkbox_at(ui, self.id("take-current"), box_left, check(self.take.0), c.primary, c.on_primary).on_hover_text("Take this side").clicked() {
+            self.take.0 = !self.take.0;
+        }
+        if w::checkbox_at(ui, self.id("take-incoming"), box_right, check(self.take.1), c.tertiary, c.on_tertiary).on_hover_text("Take this side").clicked() {
+            self.take.1 = !self.take.1;
+        }
+
+        // One button: merge both sides, take one, or stage a file fixed elsewhere.
+        enum Choice {
+            Nothing,
+            Editor,
+            Run(Op),
+        }
+        let one_side = |theirs: bool, name: &str| {
+            let op = Choice::Run(Op::Resolve { change: change.clone(), theirs });
+            match change.resolution_deletes(theirs) {
+                true => (format!("Delete, as on {name}"), ic::DELETE, op, String::new()),
+                false => (format!("Use {name}"), ic::CHECK, op, String::new()),
+            }
+        };
+        let merge = |choice: Choice, note: String| ("Merge".to_string(), ic::MERGE, choice, note);
+        let (label, icon, choice, note) = match (self.take, info.map(|i| i.state)) {
+            ((true, false), _) => one_side(false, &names.0),
+            ((false, true), _) => one_side(true, &names.1),
+            ((false, false), _) => merge(Choice::Nothing, "Tick both sides to merge them, or one side to take it whole.".into()),
+            ((true, true), None) => merge(Choice::Nothing, String::new()),
+            ((true, true), Some(FileState::Text)) => merge(Choice::Editor, String::new()),
+            ((true, true), Some(FileState::Resolved)) => {
+                let stage = Choice::Run(Op::Stage { paths: vec![change.path.clone()] });
+                ("Mark resolved".to_string(), ic::CHECK, stage, "The conflict markers are gone from this file. Staging it marks it resolved.".to_string())
+            }
+            ((true, true), Some(FileState::Binary)) => merge(Choice::Nothing, "Binary or very large file: it cannot be merged line by line. Tick one side.".into()),
+            ((true, true), Some(FileState::OneSided)) => merge(Choice::Nothing, format!("This file is {}: there is nothing to merge. Tick one side.", change.conflict_reason())),
+        };
+        let area = Rect::from_center_size(pos2(cx, button_y), vec2(rect.width() - 32.0, 44.0));
+        let mut actions = ui.new_child(egui::UiBuilder::new().id_salt("conflict-actions").max_rect(area).layout(Layout::top_down(Align::Center)));
+        let enabled = !matches!(choice, Choice::Nothing) && self.busy.is_none();
+        let clicked = w::btn(&label).icon(icon).height(44.0).enabled(enabled).show(&mut actions).clicked();
+        p.text(pos2(cx, button_y + 38.0), Align2::CENTER_CENTER, note, theme::body(12.5), c.on_surface_variant);
+        match (clicked, choice) {
+            (true, Choice::Run(op)) => self.run(&ctx, vec![op]),
+            (true, Choice::Editor) => self.open_conflict(&ctx, change),
+            _ => {}
+        }
+    }
+
     fn progress_banner(&mut self, ui: &mut Ui, rect: Rect, snap: &Snapshot) {
         let c = w::colors(ui);
         let ctx = ui.ctx().clone();
-        w::card(ui, rect, c.tertiary_container, shape::LARGE);
+        // A quiet tint: the bright container color would wash out the buttons on it.
+        w::card(ui, rect, Colors::state(c.surface_high, c.tertiary, 0.22), shape::LARGE);
         let p = ui.painter();
-        w::icon_at(p, pos2(rect.left() + 22.0, rect.top() + 22.0), ic::WARNING, 20.0, c.on_tertiary_container);
+        w::icon_at(p, pos2(rect.left() + 22.0, rect.top() + 22.0), ic::WARNING, 20.0, c.tertiary);
         let conflicts = snap.changes.iter().filter(|ch| ch.conflicted()).count();
         let text = if conflicts > 0 { format!("{} in progress \u{00b7} {conflicts} conflict(s)", snap.state.label()) } else { format!("{} in progress", snap.state.label()) };
-        p.text(pos2(rect.left() + 40.0, rect.top() + 22.0), Align2::LEFT_CENTER, text, theme::emph(13.5), c.on_tertiary_container);
+        p.text(pos2(rect.left() + 40.0, rect.top() + 22.0), Align2::LEFT_CENTER, text, theme::emph(13.5), c.on_surface);
         let state = snap.state;
         let actions = Rect::from_min_max(pos2(rect.left() + 10.0, rect.top() + 42.0), rect.max - vec2(10.0, 8.0));
         w::hchild(ui, "progress-actions", actions, |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if w::btn("Continue").icon(ic::PLAY).height(32.0).enabled(conflicts == 0).show(ui).clicked() {
+            let first = snap.changes.iter().find(|ch| ch.conflicted());
+            if let Some(change) = first
+                && w::btn("Resolve").icon(ic::EDIT).height(32.0).show(ui).on_hover_text("Open the conflict editor").clicked()
+            {
+                self.open_conflict(&ctx, change);
+            }
+            let kind = if first.is_some() { Kind::Tonal } else { Kind::Filled };
+            if w::btn("Continue").icon(ic::PLAY).kind(kind).height(32.0).enabled(conflicts == 0).show(ui).clicked() {
                 self.run(&ctx, vec![Op::Continue(state)]);
             }
             if state == InProgress::Rebase && w::btn("Skip").icon(ic::SKIP).kind(Kind::Text).height(32.0).show(ui).clicked() {
@@ -1088,7 +1640,9 @@ impl RepoView {
                 };
                 let hot = ui.rect_contains_pointer(row);
                 paint_change_row(ui.painter(), &c, row, change, status, selected, if hot { 34.0 } else { 0.0 });
-                if resp.double_clicked() {
+                if resp.double_clicked() && change.conflicted() {
+                    self.open_conflict(&ctx, change);
+                } else if resp.double_clicked() {
                     self.run(&ctx, vec![toggle(change)]);
                 } else if resp.clicked() {
                     self.pick_change(&ctx, change, staged);
@@ -1105,9 +1659,12 @@ impl RepoView {
                         self.run(&ctx, vec![toggle(change)]);
                     }
                     if change.conflicted() {
+                        if w::menu_item(ui, ic::EDIT, "Resolve in editor\u{2026}") {
+                            self.open_conflict(&ctx, change);
+                        }
                         for (label, theirs) in [("Resolve using ours", false), ("Resolve using theirs", true)] {
                             if w::menu_item(ui, ic::MERGE, label) {
-                                self.run(&ctx, vec![Op::Resolve { path: change.path.clone(), theirs }]);
+                                self.run(&ctx, vec![Op::Resolve { change: change.clone(), theirs }]);
                             }
                         }
                     }
@@ -1185,9 +1742,9 @@ impl RepoView {
             match dialog.show(ctx) {
                 Outcome::Open => {}
                 Outcome::Cancelled => self.dialog = None,
-                Outcome::Confirmed(ops) => {
+                Outcome::Confirmed(ops, keep_going) => {
                     self.dialog = None;
-                    self.run(ctx, ops);
+                    self.start(ctx, ops, keep_going);
                 }
             }
         }
@@ -1200,6 +1757,10 @@ impl RepoView {
         {
             self.text_view = None;
         }
+        self.snackbar(ctx);
+    }
+
+    fn snackbar(&mut self, ctx: &Context) {
         let Some(notice) = &self.notice else { return };
         let error = notice.error;
         // Expire before drawing: no repaint follows, so the last painted frame must not show it.
@@ -1236,19 +1797,137 @@ fn text_dialog(ctx: &Context, id: &str, icon: &str, title: &str, text: &str, sti
 
 // ---------------------------------------------------------------- painting
 
-fn side_row(ui: &mut Ui, c: &Colors, indent: usize, icon: &str, tint: Color32, text: &str, emphasized: bool, trailing: &str) -> Response {
+/// One visible row of a branch tree.
+#[derive(Debug, PartialEq)]
+pub(crate) enum TreeRow<'a> {
+    /// `key` identifies the folder for folding: the scope, then its path.
+    Folder { key: String, name: &'a str, depth: usize, open: bool },
+    /// `index` points into the names the tree was built from; `name` is the last path part.
+    Leaf { index: usize, name: &'a str, depth: usize },
+}
+
+/// Lays branch names out as a tree by their `/` separated parts: at each level the
+/// folders come first, then the branches, both alphabetical. Folders in `collapsed`
+/// are listed closed, without their contents, unless `all_open`.
+pub(crate) fn tree_rows<'a>(names: &[&'a str], collapsed: &BTreeSet<String>, scope: &str, all_open: bool) -> Vec<TreeRow<'a>> {
+    fn level<'a>(items: &[(usize, &'a str)], depth: usize, path: &str, collapsed: &BTreeSet<String>, all_open: bool, rows: &mut Vec<TreeRow<'a>>) {
+        let mut folders: std::collections::BTreeMap<(String, &'a str), Vec<(usize, &'a str)>> = Default::default();
+        let mut leaves: Vec<(usize, &'a str)> = Vec::new();
+        for &(index, rest) in items {
+            match rest.split_once('/') {
+                Some((folder, inside)) if !folder.is_empty() && !inside.is_empty() => folders.entry((folder.to_lowercase(), folder)).or_default().push((index, inside)),
+                _ => leaves.push((index, rest)),
+            }
+        }
+        for ((_, name), inside) in folders {
+            let key = format!("{path}/{name}");
+            let open = all_open || !collapsed.contains(&key);
+            rows.push(TreeRow::Folder { key: key.clone(), name, depth, open });
+            if open {
+                level(&inside, depth + 1, &key, collapsed, all_open, rows);
+            }
+        }
+        leaves.sort_by_key(|(_, name)| name.to_lowercase());
+        rows.extend(leaves.into_iter().map(|(index, name)| TreeRow::Leaf { index, name, depth }));
+    }
+    let items: Vec<(usize, &str)> = names.iter().copied().enumerate().collect();
+    let mut rows = Vec::new();
+    level(&items, 0, scope, collapsed, all_open, &mut rows);
+    rows
+}
+
+/// Indices of the names that live under the folder `key` of the tree built for `scope`.
+fn folder_members(key: &str, scope: &str, names: &[&str]) -> Vec<usize> {
+    let prefix = format!("{}/", key.get(scope.len() + 1..).unwrap_or(""));
+    names.iter().enumerate().filter(|(_, name)| name.starts_with(&prefix)).map(|(index, _)| index).collect()
+}
+
+fn toggle(set: &mut BTreeSet<String>, key: &str) {
+    if !set.remove(key) {
+        set.insert(key.to_string());
+    }
+}
+
+/// A sidebar row that folds: the usual row plus a chevron in front of its icon.
+#[allow(clippy::too_many_arguments)]
+fn fold_row(ui: &mut Ui, c: &Colors, indent: usize, icon: &str, tint: Color32, text: &str, emphasized: bool, open: bool, trail: Trail) -> Response {
+    let resp = side_row(ui, c, indent, icon, tint, text, emphasized, false, trail);
+    let chevron = pos2(resp.rect.left() + 10.0 + indent as f32 * 18.0, resp.rect.center().y);
+    w::icon_at(ui.painter(), chevron, if open { ic::EXPAND } else { ic::CHEVRON }, 16.0, c.on_surface_variant);
+    resp
+}
+
+/// What sits at the right edge of a sidebar row.
+#[derive(Clone, Copy)]
+enum Trail<'a> {
+    /// Quiet text such as ahead/behind counts; empty for nothing.
+    Text(&'a str),
+    /// A status icon in the given color.
+    Icon(&'a str, Color32),
+}
+
+fn side_row(ui: &mut Ui, c: &Colors, indent: usize, icon: &str, tint: Color32, text: &str, emphasized: bool, marked: bool, trail: Trail) -> Response {
     let (row, resp) = w::row(ui, ROW);
-    w::row_bg(ui, row, &resp, false);
+    w::row_bg(ui, row, &resp, marked);
+    let fg = if marked { c.on_secondary_container } else { c.on_surface };
     let p = ui.painter();
     let left = row.left() + 26.0 + indent as f32 * 18.0;
     w::icon_at(p, pos2(left, row.center().y), icon, 16.0, tint);
-    let trailing_w = if trailing.is_empty() { 0.0 } else { w::text_width(p, trailing, theme::body(12.0)) + 10.0 };
+    let trail_w = match trail {
+        Trail::Text("") => 0.0,
+        Trail::Text(label) => w::text_width(p, label, theme::body(12.0)) + 10.0,
+        Trail::Icon(..) => 26.0,
+    };
     let font = if emphasized { theme::emph(13.5) } else { theme::body(13.5) };
-    w::label_in(p, Rect::from_min_max(pos2(left + 14.0, row.top()), pos2(row.right() - 8.0 - trailing_w, row.bottom())), text, font, c.on_surface);
-    if !trailing.is_empty() {
-        p.text(pos2(row.right() - 10.0, row.center().y), Align2::RIGHT_CENTER, trailing, theme::body(12.0), c.on_surface_variant);
+    w::label_in(p, Rect::from_min_max(pos2(left + 14.0, row.top()), pos2(row.right() - 8.0 - trail_w, row.bottom())), text, font, fg);
+    match trail {
+        Trail::Text(label) => {
+            p.text(pos2(row.right() - 10.0, row.center().y), Align2::RIGHT_CENTER, label, theme::body(12.0), c.on_surface_variant);
+        }
+        Trail::Icon(glyph, color) => w::icon_at(p, pos2(row.right() - 18.0, row.center().y), glyph, 16.0, color),
     }
     resp
+}
+
+/// One side of a conflict: branch, what it did to the file, and its commits on it.
+#[allow(clippy::too_many_arguments)]
+fn side_card(ui: &Ui, c: &Colors, rect: Rect, side: Option<&ConflictSide>, name: &str, accent: Color32, taken: bool, status: (char, &str)) {
+    let p = ui.painter().with_clip_rect(rect);
+    p.rect_filled(rect, w::radius(shape::LARGE), c.surface_low);
+    let outline = if taken { Stroke::new(1.5, accent) } else { Stroke::new(1.0, c.outline_variant) };
+    p.rect_stroke(rect, w::radius(shape::LARGE), outline, egui::StrokeKind::Inside);
+    let mid = rect.top() + 24.0;
+    w::icon_at(&p, pos2(rect.left() + 20.0, mid), ic::BRANCH, 18.0, accent);
+    let status_w = w::text_width(&p, status.1, theme::body(12.0)) + 36.0;
+    w::label_in(&p, Rect::from_min_max(pos2(rect.left() + 36.0, mid - 12.0), pos2(rect.right() - status_w - 8.0, mid + 12.0)), name, theme::emph(14.5), c.on_surface);
+    w::status_badge(&p, pos2(rect.right() - status_w + 8.0, mid), status.0, c);
+    p.text(pos2(rect.right() - 12.0, mid), Align2::RIGHT_CENTER, status.1, theme::body(12.0), c.on_surface_variant);
+    p.hline(rect.shrink(14.0).x_range(), rect.top() + 46.0, Stroke::new(1.0, c.outline_variant));
+
+    let list = Rect::from_min_max(pos2(rect.left() + 12.0, rect.top() + 54.0), rect.max - vec2(12.0, 10.0));
+    let Some(side) = side else {
+        w::loading_indicator(ui, list.center(), 14.0);
+        return;
+    };
+    if side.commits.is_empty() {
+        let empty = if side.tip.is_some() { "No commits touch this file here" } else { "Not a commit" };
+        p.text(list.left_top() + vec2(4.0, 12.0), Align2::LEFT_CENTER, empty, theme::body(12.5), c.on_surface_variant);
+    }
+    let fits = (list.height() / 22.0).floor() as usize;
+    for (index, commit) in side.commits.iter().take(fits).enumerate() {
+        let row = Rect::from_min_size(pos2(list.left(), list.top() + index as f32 * 22.0), vec2(list.width(), 22.0));
+        let more = index + 1 == fits && side.commits.len() > fits;
+        if more {
+            p.text(pos2(row.left() + 4.0, row.center().y), Align2::LEFT_CENTER, format!("and {} more", side.commits.len() - index), theme::body(12.0), c.on_surface_variant);
+            break;
+        }
+        w::avatar(&p, pos2(row.left() + 10.0, row.center().y), 8.0, &commit.author, c);
+        p.text(pos2(row.left() + 24.0, row.center().y), Align2::LEFT_CENTER, commit.sha.get(..7).unwrap_or(&commit.sha), theme::mono(11.5), c.on_surface_variant);
+        let date = commit.date.get(..10).unwrap_or(&commit.date);
+        let date_w = w::text_width(&p, date, theme::body(12.0));
+        p.text(pos2(row.right() - 2.0, row.center().y), Align2::RIGHT_CENTER, date, theme::body(12.0), c.on_surface_variant);
+        w::label_in(&p, Rect::from_min_max(pos2(row.left() + 82.0, row.top()), pos2(row.right() - date_w - 12.0, row.bottom())), &commit.subject, theme::body(12.5), c.on_surface);
+    }
 }
 
 /// Status badge, file name, then its directory in a quieter tone.
@@ -1391,6 +2070,35 @@ fn paint_diff(ui: &mut Ui, c: &Colors, diff: &Diff) {
             p.text(pos2(row.left() + gutter, mid), Align2::LEFT_CENTER, &line.text, font.clone(), fg);
         }
     });
+}
+
+/// Selection change for a Ctrl or Shift click on `key`. Shift selects the range from the
+/// anchor (the last row toggled) through `key`, in display `order`; otherwise the row is
+/// toggled and becomes the anchor.
+pub(crate) fn apply_selection(marked: &mut BTreeSet<String>, anchor: &mut Option<String>, order: &[String], key: &str, shift: bool) {
+    let position = |wanted: &str| order.iter().position(|k| k == wanted);
+    if let (true, Some(from), Some(to)) = (shift, anchor.as_deref().and_then(position), position(key)) {
+        marked.clear();
+        marked.extend(order[from.min(to)..=from.max(to)].iter().cloned());
+        return;
+    }
+    if !marked.remove(key) {
+        marked.insert(key.to_string());
+    }
+    *anchor = Some(key.to_string());
+}
+
+/// The delete operation for one marked row.
+fn batch_op(group: Group, name: &str, remotes: &[String], force: bool) -> Option<Op> {
+    Some(match group {
+        Group::Local => Op::DeleteBranch { name: name.into(), force },
+        Group::Tag => Op::DeleteTag { name: name.into() },
+        Group::Worktree => Op::WorktreeRemove { path: name.into(), force },
+        Group::Remote => {
+            let remote = remotes.iter().find(|r| name.strip_prefix(r.as_str()).is_some_and(|rest| rest.starts_with('/')))?;
+            Op::DeleteRemoteBranch { remote: remote.clone(), name: name[remote.len() + 1..].into() }
+        }
+    })
 }
 
 /// `take` count for the rows of a collapsible section.

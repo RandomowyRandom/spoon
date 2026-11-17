@@ -129,6 +129,10 @@ pub struct Remote {
 pub struct Worktree {
     pub path: String,
     pub branch: String,
+    /// The repository's own work tree; it cannot be removed.
+    pub main: bool,
+    /// Its folder is gone; `git worktree prune` would drop the entry.
+    pub prunable: bool,
 }
 
 /// One changed path. `index`/`work` are the porcelain status letters;
@@ -148,6 +152,31 @@ impl Change {
             ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
         )
     }
+    /// Git's name for the kind of conflict; empty when the path is not in conflict.
+    pub fn conflict_reason(&self) -> &'static str {
+        match (self.index, self.work) {
+            ('D', 'D') => "both deleted",
+            ('A', 'U') => "added by us",
+            ('U', 'D') => "deleted by them",
+            ('U', 'A') => "added by them",
+            ('D', 'U') => "deleted by us",
+            ('A', 'A') => "both added",
+            ('U', 'U') => "both modified",
+            _ => "",
+        }
+    }
+
+    /// Whether resolving with one side means the file goes away, because that side
+    /// deleted it or never had it.
+    pub fn resolution_deletes(&self, theirs: bool) -> bool {
+        match (self.index, self.work) {
+            ('D', 'D') => true,
+            ('U', 'D') | ('A', 'U') => theirs,
+            ('D', 'U') | ('U', 'A') => !theirs,
+            _ => false,
+        }
+    }
+
     pub fn untracked(&self) -> bool {
         self.index == '?'
     }
@@ -372,9 +401,12 @@ pub fn parse_worktrees(out: &str) -> Vec<Worktree> {
     let mut list: Vec<Worktree> = Vec::new();
     for line in out.lines() {
         if let Some(path) = line.strip_prefix("worktree ") {
-            list.push(Worktree { path: path.into(), branch: "detached".into() });
+            // git lists the main work tree first.
+            list.push(Worktree { path: path.into(), branch: "detached".into(), main: list.is_empty(), prunable: false });
         } else if let (Some(b), Some(last)) = (line.strip_prefix("branch refs/heads/"), list.last_mut()) {
             last.branch = b.into();
+        } else if let (true, Some(last)) = (line.starts_with("prunable"), list.last_mut()) {
+            last.prunable = true;
         }
     }
     list
@@ -498,6 +530,64 @@ pub fn in_progress(repo: &Path) -> InProgress {
     } else {
         InProgress::None
     }
+}
+
+/// One side of an operation that stopped on conflicts.
+#[derive(Clone, Debug, Default)]
+pub struct ConflictSide {
+    /// Branch name, or a short hash when no branch points at it.
+    pub name: String,
+    pub tip: Option<Commit>,
+    /// Commits that touched the file on this side only, newest first.
+    pub commits: Vec<Commit>,
+}
+
+/// The two sides in conflict over `path`: (current, incoming).
+///
+/// - merge, cherry-pick, revert: HEAD against the commit being brought in
+/// - rebase: the commit rebased onto against the commit being replayed
+/// - no operation (a stash or patch applied with conflicts): HEAD against "Stash or patch"
+pub fn conflict_sides(repo: &Path, path: &str) -> (ConflictSide, ConflictSide) {
+    let git_dir = PathBuf::from(run(repo, &["rev-parse", "--absolute-git-dir"]).stdout.trim());
+    let read = |name: String| std::fs::read_to_string(git_dir.join(name)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let exists = |rev: &str| run(repo, &["rev-parse", "-q", "--verify", rev]).ok;
+
+    // (current revision, incoming revision, name of the branch being replayed)
+    let rebase = ["rebase-merge", "rebase-apply"].into_iter().find(|dir| git_dir.join(dir).is_dir());
+    let (current, incoming, replayed) = match rebase {
+        Some(dir) => {
+            let stopped = if exists("REBASE_HEAD") { Some("REBASE_HEAD".to_string()) } else { read(format!("{dir}/stopped-sha")) };
+            let branch = read(format!("{dir}/head-name")).map(|name| name.trim_start_matches("refs/heads/").to_string());
+            (read(format!("{dir}/onto")).unwrap_or_else(|| "HEAD".into()), stopped, branch)
+        }
+        None => ("HEAD".to_string(), ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"].into_iter().find(|rev| exists(rev)).map(String::from), None),
+    };
+
+    let log = |extra: &[&str]| {
+        let mut a = strings(&["log", "--no-show-signature", "--decorate=full", DATE_FORMAT, LOG_FORMAT]);
+        a.extend(strings(extra));
+        parse_commits(&run(repo, &a).stdout)
+    };
+    let branch_of = |rev: &str| {
+        let refs = run(repo, &["for-each-ref", "--points-at", rev, "--format=%(refname:short)", "refs/heads", "refs/remotes"]);
+        match refs.stdout.lines().next() {
+            Some(name) => name.to_string(),
+            None => run(repo, &["rev-parse", "--short", rev]).stdout.trim().to_string(),
+        }
+    };
+    // Commits on the file that only this side has; without another side, its recent ones.
+    let side = |rev: &str, other: Option<&str>, name: String| {
+        let range = other.map_or_else(|| rev.to_string(), |other| format!("{other}..{rev}"));
+        ConflictSide { name, tip: log(&["-n1", rev, "--"]).into_iter().next(), commits: log(&["-n30", &range, "--", path]) }
+    };
+
+    let current_name = if current == "HEAD" { head(repo).label() } else { branch_of(&current) };
+    let current_side = side(&current, incoming.as_deref(), current_name);
+    let incoming_side = match &incoming {
+        Some(rev) => side(rev, Some(&current), replayed.unwrap_or_else(|| branch_of(rev))),
+        None => ConflictSide { name: "Stash or patch".into(), ..Default::default() },
+    };
+    (current_side, incoming_side)
 }
 
 pub fn full_message(repo: &Path, sha: &str) -> String {
@@ -647,8 +737,13 @@ pub enum Op {
     Continue(InProgress),
     Abort(InProgress),
     Skip,
-    Resolve { path: String, theirs: bool },
+    /// Settles a conflict with one side's version, whatever kind of conflict it is.
+    Resolve { change: Change, theirs: bool },
     SubmoduleUpdate,
+    /// Checks out `target` in a new folder; with `new_branch`, on a new branch started there.
+    WorktreeAdd { path: String, target: String, new_branch: Option<String> },
+    WorktreeRemove { path: String, force: bool },
+    WorktreePrune,
 }
 
 /// Rejects values git would read as an option or that cannot be a name.
@@ -726,6 +821,9 @@ impl Op {
             Op::Skip => "Skip",
             Op::Resolve { .. } => "Resolve conflict",
             Op::SubmoduleUpdate => "Update submodules",
+            Op::WorktreeAdd { .. } => "Add worktree",
+            Op::WorktreeRemove { .. } => "Remove worktree",
+            Op::WorktreePrune => "Prune worktrees",
         }
     }
 
@@ -857,7 +955,12 @@ impl Op {
             Op::Continue(state) => one(strings(&[state.subcommand()?, "--continue"])),
             Op::Abort(state) => one(strings(&[state.subcommand()?, "--abort"])),
             Op::Skip => one(strings(&["rebase", "--skip"])),
-            Op::Resolve { path, theirs } => {
+            Op::Resolve { change, theirs } => {
+                let path = &change.path;
+                if change.resolution_deletes(*theirs) {
+                    // That side has no such file: taking it removes the file.
+                    return one(vec!["rm".into(), "-q".into(), "--".into(), path.clone()]);
+                }
                 let side = if *theirs { "--theirs" } else { "--ours" };
                 Ok(vec![
                     vec!["checkout".into(), side.into(), "--".into(), path.clone()],
@@ -865,6 +968,29 @@ impl Op {
                 ])
             }
             Op::SubmoduleUpdate => one(strings(&["submodule", "update", "--init", "--recursive"])),
+            Op::WorktreeAdd { path, target, new_branch } => {
+                let branch = new_branch.as_ref().map(|name| arg(name, "branch name")).transpose()?;
+                let (target, path) = (arg(target, "branch")?, arg(path, "folder")?);
+                // git creates the new branch before it looks at the folder, and leaves the
+                // branch behind when the folder is unusable. So check the folder first.
+                let folder = Path::new(&path);
+                if !folder.is_absolute() {
+                    return Err("worktree folder must be an absolute path".into());
+                }
+                if folder.is_file() || folder.read_dir().is_ok_and(|mut entries| entries.next().is_some()) {
+                    return Err(format!("{path} already exists and is not empty"));
+                }
+                let mut a = strings(&["worktree", "add"]);
+                if let Some(name) = branch {
+                    a.extend(["-b".into(), name]);
+                }
+                a.extend([path, target]);
+                one(a)
+            }
+            Op::WorktreeRemove { path, force } => {
+                one(flagged(&["worktree", "remove"], &[(*force, "--force")], &[arg(path, "worktree")?]))
+            }
+            Op::WorktreePrune => one(strings(&["worktree", "prune"])),
         }
     }
 }
@@ -897,6 +1023,31 @@ pub fn run_op(repo: &Path, op: &Op) -> OpResult {
         Ok(steps) => run_steps(repo, &steps),
         Err(error) => OpResult { ok: false, log: format!("{}: {error}\n", op.title()), error },
     }
+}
+
+/// Runs `ops` in order. Normally the first failure stops the run (the later steps
+/// depend on it). With `keep_going` the operations are independent, as in a batch
+/// delete: all of them run and every failure is reported.
+pub fn run_ops(repo: &Path, ops: &[Op], keep_going: bool) -> OpResult {
+    let mut total = OpResult { ok: true, ..Default::default() };
+    let mut errors = Vec::new();
+    for op in ops {
+        let result = run_op(repo, op);
+        total.log += &result.log;
+        if !result.ok {
+            errors.push(result.error.trim().to_string());
+            if !keep_going {
+                break;
+            }
+        }
+    }
+    total.ok = errors.is_empty();
+    total.error = if keep_going && !errors.is_empty() {
+        format!("{} of {} failed:\n{}", errors.len(), ops.len(), errors.join("\n"))
+    } else {
+        errors.join("\n")
+    };
+    total
 }
 
 pub fn init(path: &Path) -> OpResult {

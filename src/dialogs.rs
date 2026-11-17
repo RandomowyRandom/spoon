@@ -2,7 +2,9 @@
 
 use eframe::egui;
 
-use crate::git::{Branch, Change, Commit, Head, MergeMode, Op, ResetMode, Snapshot, short};
+use std::path::Path;
+
+use crate::git::{Branch, Change, Commit, Head, MergeMode, Op, ResetMode, Snapshot, Worktree, short};
 use crate::widgets::{self as w, Kind, ic};
 
 pub enum Field {
@@ -46,17 +48,19 @@ pub struct Dialog {
     danger: bool,
     make: Box<dyn Fn(&[Field]) -> Vec<Op>>,
     focused: bool,
+    keep_going: bool,
 }
 
 pub enum Outcome {
     Open,
     Cancelled,
-    Confirmed(Vec<Op>),
+    /// The operations, and whether they are independent (run all, report every failure).
+    Confirmed(Vec<Op>, bool),
 }
 
 impl Dialog {
     fn new(icon: &'static str, title: &'static str, body: String, fields: Vec<Field>, confirm: &'static str, make: impl Fn(&[Field]) -> Vec<Op> + 'static) -> Self {
-        Self { icon, title, body, fields, confirm, danger: false, make: Box::new(make), focused: false }
+        Self { icon, title, body, fields, confirm, danger: false, make: Box::new(make), focused: false, keep_going: false }
     }
 
     fn danger(mut self) -> Self {
@@ -65,7 +69,7 @@ impl Dialog {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> Outcome {
-        let Dialog { icon, title, body, fields, confirm, danger, make, focused } = self;
+        let Dialog { icon, title, body, fields, confirm, danger, make, focused, keep_going } = self;
         let (action, dismissed) = w::dialog(ctx, "operation-dialog", icon, title, 440.0, |ui| {
             if !body.is_empty() {
                 w::body_text(ui, body);
@@ -99,7 +103,7 @@ impl Dialog {
             w::dialog_actions(ui, confirm, kind, valid).or(enter.then_some(true))
         });
         match action {
-            Some(true) => Outcome::Confirmed(make(fields)),
+            Some(true) => Outcome::Confirmed(make(fields), *keep_going),
             Some(false) => Outcome::Cancelled,
             None if dismissed => Outcome::Cancelled,
             None => Outcome::Open,
@@ -131,6 +135,15 @@ fn tracking(snap: &Snapshot) -> Result<(String, String, String, bool), String> {
 
 pub fn confirm(icon: &'static str, title: &'static str, body: String, confirm: &'static str, ops: Vec<Op>) -> Dialog {
     Dialog::new(icon, title, body, vec![], confirm, move |_| ops.clone())
+}
+
+/// Confirmation for a batch of independent operations. `force` adds a switch whose
+/// state is passed to `make`.
+pub fn batch(title: &'static str, body: String, force: Option<&'static str>, confirm: &'static str, make: impl Fn(bool) -> Vec<Op> + 'static) -> Dialog {
+    let fields = force.map(|label| toggle(label, false)).into_iter().collect();
+    let mut dialog = Dialog::new(ic::DELETE, title, body, fields, confirm, move |f| make(on(f, 0))).danger();
+    dialog.keep_going = true;
+    dialog
 }
 
 pub fn pull(snap: &Snapshot) -> Result<Dialog, String> {
@@ -286,6 +299,38 @@ pub fn add_remote(first: bool) -> Dialog {
 pub fn remove_remote(name: String) -> Dialog {
     let body = format!("Remove remote {name} and its remote-tracking branches.");
     confirm(ic::DELETE, "Remove remote", body, "Remove", vec![Op::RemoveRemote { name }]).danger()
+}
+
+/// Default folder for a new worktree: a sibling of the repository, named after the branch.
+fn worktree_folder(repo: &Path, branch: &str) -> String {
+    let name = repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let suffix: String = branch.chars().map(|ch| if ch.is_alphanumeric() || "-_.".contains(ch) { ch } else { '-' }).collect();
+    repo.with_file_name(format!("{name}-{suffix}")).display().to_string()
+}
+
+/// `branch` given: check that existing branch out. Otherwise: start a new branch at HEAD.
+pub fn add_worktree(repo: &Path, branch: Option<&str>) -> Dialog {
+    let fields = vec![
+        required("Branch", branch.unwrap_or(""), "feature/my-branch"),
+        toggle("Create this branch from the current commit", branch.is_none()),
+        required("Folder", &worktree_folder(repo, branch.unwrap_or("worktree")), "New or empty folder"),
+    ];
+    let body = "Check a branch out in a second folder, so both can be worked on at once.".to_string();
+    Dialog::new(ic::WORKTREE, "Add worktree", body, fields, "Add", |f| {
+        let (name, path) = (text(f, 0), text(f, 2));
+        vec![if on(f, 1) {
+            Op::WorktreeAdd { path, target: "HEAD".into(), new_branch: Some(name) }
+        } else {
+            Op::WorktreeAdd { path, target: name, new_branch: None }
+        }]
+    })
+}
+
+pub fn remove_worktree(tree: &Worktree) -> Dialog {
+    let path = tree.path.clone();
+    let body = format!("Remove the worktree at {path}. The folder is deleted; branch {} and its commits stay.", tree.branch);
+    let fields = vec![toggle("Force: also discard uncommitted changes there", false)];
+    Dialog::new(ic::DELETE, "Remove worktree", body, fields, "Remove", move |f| vec![Op::WorktreeRemove { path: path.clone(), force: on(f, 0) }]).danger()
 }
 
 pub fn cherry_pick(snap: &Snapshot, commit: &Commit) -> Result<Dialog, String> {

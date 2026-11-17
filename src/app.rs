@@ -448,6 +448,9 @@ impl eframe::App for App {
             Some(index) => self.repos[index].ui(ui, body),
             None => self.welcome(ui, body),
         }
+        for repo in &mut self.repos {
+            repo.merge_window(&ctx);
+        }
         self.clone_dialog(&ctx);
         if self.settings {
             self.settings_dialog(&ctx);

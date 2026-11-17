@@ -24,7 +24,7 @@ impl Default for Prefs {
 }
 
 /// `%APPDATA%\Spoon` on Windows, `$XDG_CONFIG_HOME/spoon` (or `~/.config/spoon`) elsewhere.
-fn config_dir() -> Option<PathBuf> {
+pub fn config_dir() -> Option<PathBuf> {
     let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
     if cfg!(windows) {
         return Some(var("APPDATA")?.join("Spoon"));

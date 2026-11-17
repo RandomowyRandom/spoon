@@ -33,6 +33,7 @@ pub mod ic {
     pub const REBASE: &str = ICON_MEDIATION.codepoint;
     pub const TAG: &str = ICON_SELL.codepoint;
     pub const CLOUD: &str = ICON_CLOUD.codepoint;
+    pub const UPSTREAM_GONE: &str = ICON_CLOUD_OFF.codepoint;
     pub const FOLDER: &str = ICON_FOLDER.codepoint;
     pub const FOLDER_OPEN: &str = ICON_FOLDER_OPEN.codepoint;
     pub const NEW_FOLDER: &str = ICON_CREATE_NEW_FOLDER.codepoint;
@@ -43,6 +44,8 @@ pub mod ic {
     pub const CHEVRON: &str = ICON_CHEVRON_RIGHT.codepoint;
     pub const EDIT: &str = ICON_EDIT.codepoint;
     pub const UNDO: &str = ICON_UNDO.codepoint;
+    pub const UP: &str = ICON_KEYBOARD_ARROW_UP.codepoint;
+    pub const DOWN: &str = ICON_KEYBOARD_ARROW_DOWN.codepoint;
     pub const DELETE: &str = ICON_DELETE.codepoint;
     pub const DARK: &str = ICON_DARK_MODE.codepoint;
     pub const LIGHT: &str = ICON_LIGHT_MODE.codepoint;
@@ -89,7 +92,11 @@ pub fn card(ui: &Ui, rect: Rect, fill: Color32, r: f32) {
 }
 
 pub fn icon_at(p: &Painter, center: Pos2, icon: &str, size: f32, color: Color32) {
-    p.text(center, Align2::CENTER_CENTER, icon, theme::icon(size), color);
+    // Centre the drawn glyph, not the font's line box: the two differ by a pixel or two,
+    // which shows in small containers such as the switch thumb.
+    let galley = p.layout_no_wrap(icon.to_owned(), theme::icon(size), color);
+    let pos = center - galley.mesh_bounds.center().to_vec2();
+    p.galley(pos, galley, color);
 }
 
 /// One line of text, vertically centred in `rect` and truncated with an ellipsis.
@@ -503,6 +510,31 @@ pub fn text_area(ui: &mut Ui, salt: &str, rect: Rect, text: &mut String, hint: &
     let stroke = if resp.has_focus() { Stroke::new(2.0, c.primary) } else { Stroke::NONE };
     let shape = egui::epaint::RectShape::new(rect, radius(shape::LARGE), c.surface_highest, stroke, StrokeKind::Inside);
     ui.painter().set(background, shape);
+    resp
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Check {
+    Off,
+    On,
+    /// Some of a group.
+    Mixed,
+}
+
+/// M3 checkbox centred at `center`, in the given accent color. The caller applies the click.
+pub fn checkbox_at(ui: &Ui, id: Id, center: Pos2, state: Check, accent: Color32, on_accent: Color32) -> Response {
+    let c = colors(ui);
+    let resp = ui.interact(Rect::from_center_size(center, Vec2::splat(30.0)), id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    let (hover, press) = interaction(ui, &resp);
+    let filled = ui.ctx().animate_bool_with_time(id.with("checked"), state != Check::Off, 0.12);
+    let p = ui.painter();
+    p.circle_filled(center, 15.0, accent.gamma_multiply(0.10 * hover + 0.10 * press));
+    let square = Rect::from_center_size(center, Vec2::splat(18.0));
+    p.rect_stroke(square, radius(4.0), Stroke::new(2.0, c.on_surface_variant.gamma_multiply(1.0 - filled)), StrokeKind::Inside);
+    p.rect_filled(square, radius(4.0), accent.gamma_multiply(filled));
+    if state != Check::Off {
+        icon_at(p, center, if state == Check::On { ic::CHECK } else { ic::REMOVE }, 15.0, on_accent.gamma_multiply(filled));
+    }
     resp
 }
 
