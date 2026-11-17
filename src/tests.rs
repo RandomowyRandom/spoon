@@ -1332,8 +1332,7 @@ fn branches_group_into_folders_by_prefix() {
     let names = ["main", "develop", "feat/anims/Value", "feat/anims/Animation", "feat/twin/x", "feat/workstation-setup", "backup/pre-split", "Hotfix-1.2.1", "feat/anims-rebase-a01"];
     // Compact form: depth, then "+name" open folder, "-name" closed folder, or a branch's full name.
     let show = |opened: &[&str], all_open: bool| -> Vec<String> {
-        let opened = opened.iter().map(|k| k.to_string()).collect();
-        tree_rows(&names, &opened, "local", all_open)
+        tree_rows(&names, "local", &|key| all_open || opened.contains(&key))
             .iter()
             .map(|row| match row {
                 TreeRow::Folder { name, depth, open, .. } => format!("{depth}{}{name}", if *open { '+' } else { '-' }),
@@ -1365,12 +1364,12 @@ fn branches_group_into_folders_by_prefix() {
     assert_eq!(show(&[], true), expected);
 
     // Keys name the folder's full path, so equal names at different places fold apart.
-    let keys: Vec<String> = tree_rows(&names, &Default::default(), "remote/origin", true).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
+    let keys: Vec<String> = tree_rows(&names, "remote/origin", &|_| true).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
     assert_eq!(keys, ["remote/origin/backup", "remote/origin/feat", "remote/origin/feat/anims", "remote/origin/feat/twin"]);
 
     // Odd names never loop or vanish: every branch still appears exactly once.
     let odd = ["a//b", "/lead", "trail/", "//", "", "x/y/z/w"];
-    let mut seen: Vec<usize> = tree_rows(&odd, &Default::default(), "local", true).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
+    let mut seen: Vec<usize> = tree_rows(&odd, "local", &|_| true).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
     seen.sort();
     assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
 }

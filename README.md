@@ -42,7 +42,8 @@ Spoon drives the `git` command line, so Git must be installed.
 - Open in: a terminal, Git Bash, the file manager, and the editors found on the machine
   (VS Code, Cursor, Zed, Sublime Text, Visual Studio, JetBrains IDEs and others), plus
   the repository's page on GitHub, GitLab or its own host
-- Unified diff viewer, file history, blame, command log
+- Unified diff viewer, a commit's changed files as a folder tree, file history, blame,
+  command log
 - Clone, init, tabs for several repositories, submodule list
 
 Not ported from SourceGit yet: interactive rebase, hunk and line staging, launching an
@@ -124,6 +125,7 @@ Preferences are stored in `%APPDATA%\Spoon\preference.json` on Windows and in
 | `src/conflict.rs` | Merge conflict model: parse markers, pick lines, render |
 | `src/merge_editor.rs` | Conflict editor UI |
 | `src/open_in.rs` | Finds installed terminals and editors, opens the repository in them |
+| `src/dpi_drag.rs` | Windows: keeps a window dragged between screens of different scaling from jumping |
 | `src/app.rs` | Tabs, welcome page, clone, appearance settings |
 | `src/icon.rs` | The logo, generated in code (`spoon --export-logo assets`) |
 | `src/tests.rs` | Git workflow tests |

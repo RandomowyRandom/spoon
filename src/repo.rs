@@ -42,6 +42,26 @@ enum Group {
 }
 
 /// What the detail cards show: a commit or a stash.
+/// One row of the file tree in the details card.
+enum FileRow {
+    Folder { key: String, name: String, depth: usize, open: bool },
+    /// Index into the detail's files.
+    File { index: usize, depth: usize },
+}
+
+/// Lays changed files out by folder, the way the sidebar lays out branches. Every
+/// folder is open unless it is in `folded`.
+fn file_rows(files: &[Change], folded: &BTreeSet<String>) -> Vec<FileRow> {
+    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+    let rows = tree_rows(&paths, "files", &|key| !folded.contains(key));
+    rows.into_iter()
+        .map(|row| match row {
+            TreeRow::Folder { key, name, depth, open } => FileRow::Folder { key, name: name.to_string(), depth, open },
+            TreeRow::Leaf { index, depth, .. } => FileRow::File { index, depth },
+        })
+        .collect()
+}
+
 struct Detail {
     sha: String,
     base: String,
@@ -123,6 +143,10 @@ pub struct RepoView {
     wanted: Option<String>,
     detail: Option<Arc<Detail>>,
     detail_file: Option<usize>,
+    /// Folders folded in the details' file tree, by key: `files/src/kitchen`.
+    folded: BTreeSet<String>,
+    /// The file tree's rows, rebuilt when the details or `folded` change.
+    file_rows: Option<Vec<FileRow>>,
     picked: Option<(String, bool)>,
     message: String,
     amend: bool,
@@ -184,6 +208,8 @@ impl RepoView {
             wanted: None,
             detail: None,
             detail_file: None,
+            folded: BTreeSet::new(),
+            file_rows: None,
             picked: None,
             message: String::new(),
             amend: false,
@@ -269,11 +295,15 @@ impl RepoView {
                 Msg::Snapshot(snap, graph) => self.on_snapshot(ctx, *snap, graph),
                 Msg::Done(title, result) => self.on_done(ctx, title, result),
                 Msg::Detail(detail) if self.wanted.as_deref() == Some(&detail.sha) => {
-                    let first = detail.files.first().cloned();
+                    // Open on the file at the top of the tree, which lists folders first.
+                    let rows = file_rows(&detail.files, &self.folded);
+                    let first = rows.iter().find_map(|row| if let FileRow::File { index, .. } = row { Some(*index) } else { None });
+                    let first = first.map(|index| (index, detail.files[index].clone()));
                     self.detail = Some(Arc::new(detail));
                     self.detail_file = None;
-                    if let Some(change) = first {
-                        self.pick_file(ctx, 0, change);
+                    self.file_rows = Some(rows);
+                    if let Some((index, change)) = first {
+                        self.pick_file(ctx, index, change);
                     }
                 }
                 Msg::Diff(generation, diff) if generation == self.diff_generation => self.diff = Some(Arc::new(diff)),
@@ -429,8 +459,7 @@ impl RepoView {
             Group::Tag => snap.tags.iter().any(|t| &t.name == key),
             Group::Worktree => snap.worktrees.iter().any(|t| &t.path == key),
         });
-        self.snap = Some(Arc::new(snap));
-        self.graph = Arc::new(graph);
+        self.snap = Some(Arc::new(snap));        self.graph = Arc::new(graph);
     }
 
     // ------------------------------------------------------------ selection
@@ -446,6 +475,8 @@ impl RepoView {
         self.wanted = None;
         self.detail = None;
         self.detail_file = None;
+        self.folded.clear();
+        self.file_rows = None;
         self.clear_diff();
     }
 
@@ -790,7 +821,7 @@ impl RepoView {
         // so it is never hunted for.
         let (current, locals): (Vec<&Branch>, Vec<&Branch>) = locals.into_iter().partition(|b| b.current);
         let names: Vec<&str> = locals.iter().map(|b| b.name.as_str()).collect();
-        let rows = tree_rows(&names, &self.opened, "local", filtering);
+        let rows = tree_rows(&names, "local", &|key| filtering || self.opened.contains(key));
         let order: Vec<String> = current.iter().map(|b| b.name.clone()).chain(leaves(&rows, &locals)).collect();
         for branch in current.iter().take(visible(self.open[0])) {
             self.local_branch_row(ui, ctx, snap, c, branch, &branch.name, 0, &order);
@@ -826,7 +857,7 @@ impl RepoView {
                 let open = filtering || self.opened.contains(&key);
                 let branches: Vec<&Branch> = snap.branches.iter().filter(|b| b.remote.as_deref() == Some(&remote.name) && shown(&b.name)).collect();
                 let short: Vec<&str> = branches.iter().map(|b| b.name.get(remote.name.len() + 1..).unwrap_or(&b.name)).collect();
-                let rows = if open { tree_rows(&short, &self.opened, &key, filtering) } else { Vec::new() };
+                let rows = if open { tree_rows(&short, &key, &|folder| filtering || self.opened.contains(folder)) } else { Vec::new() };
                 RemoteTree { remote, key, open, branches, short, rows }
             })
             .collect();
@@ -1423,13 +1454,27 @@ impl RepoView {
         y += 24.0;
 
         let list = Rect::from_min_max(pos2(inner.left(), y), inner.max);
-        w::rows(ui, "detail-files", list, ROW, detail.files.len(), None, |ui, range| {
-            for i in range {
+        let rows = self.file_rows.take().unwrap_or_else(|| file_rows(&detail.files, &self.folded));
+        let mut refold = false;
+        w::rows(ui, "detail-files", list, ROW, rows.len(), None, |ui, range| {
+            for row in &rows[range] {
+                let (i, depth) = match row {
+                    FileRow::Folder { key, name, depth, open } => {
+                        let icon = if *open { ic::FOLDER_OPEN } else { ic::FOLDER };
+                        if fold_row(ui, &c, *depth, icon, c.on_surface_variant, name, false, *open, Trail::Text("")).clicked() {
+                            toggle(&mut self.folded, key);
+                            refold = true;
+                        }
+                        continue;
+                    }
+                    FileRow::File { index, depth } => (*index, *depth),
+                };
                 let change = &detail.files[i];
                 let (row, resp) = w::row(ui, ROW);
                 let selected = self.detail_file == Some(i);
                 w::row_bg(ui, row, &resp, selected);
-                paint_change_row(ui.painter(), &c, row, change, change.index, selected, 0.0);
+                paint_tree_file(ui.painter(), &c, row, change, depth, selected);
+                let resp = resp.on_hover_text(&change.path);
                 if resp.clicked() {
                     self.pick_file(&ctx, i, change.clone());
                 }
@@ -1446,6 +1491,8 @@ impl RepoView {
                 });
             }
         });
+        // Picking a file loads new details only on another commit, so the rows still fit.
+        self.file_rows = (!refold && self.detail.as_ref().is_some_and(|d| d.sha == detail.sha)).then_some(rows);
     }
 
     fn diff_card(&mut self, ui: &mut Ui, rect: Rect) {
@@ -1872,11 +1919,11 @@ pub(crate) enum TreeRow<'a> {
     Leaf { index: usize, name: &'a str, depth: usize },
 }
 
-/// Lays branch names out as a tree by their `/` separated parts: at each level the
-/// folders come first, then the branches, both alphabetical. Folders are listed
-/// closed, without their contents, unless they are in `opened` or `all_open` is set.
-pub(crate) fn tree_rows<'a>(names: &[&'a str], opened: &BTreeSet<String>, scope: &str, all_open: bool) -> Vec<TreeRow<'a>> {
-    fn level<'a>(items: &[(usize, &'a str)], depth: usize, path: &str, opened: &BTreeSet<String>, all_open: bool, rows: &mut Vec<TreeRow<'a>>) {
+/// Lays names (branches, file paths) out as a tree by their `/` separated parts: at
+/// each level the folders come first, then the leaves, both alphabetical. A folder
+/// that `is_open` rejects for its key is listed closed, without its contents.
+pub(crate) fn tree_rows<'a>(names: &[&'a str], scope: &str, is_open: &dyn Fn(&str) -> bool) -> Vec<TreeRow<'a>> {
+    fn level<'a>(items: &[(usize, &'a str)], depth: usize, path: &str, is_open: &dyn Fn(&str) -> bool, rows: &mut Vec<TreeRow<'a>>) {
         let mut folders: std::collections::BTreeMap<(String, &'a str), Vec<(usize, &'a str)>> = Default::default();
         let mut leaves: Vec<(usize, &'a str)> = Vec::new();
         for &(index, rest) in items {
@@ -1887,10 +1934,10 @@ pub(crate) fn tree_rows<'a>(names: &[&'a str], opened: &BTreeSet<String>, scope:
         }
         for ((_, name), inside) in folders {
             let key = format!("{path}/{name}");
-            let open = all_open || opened.contains(&key);
+            let open = is_open(&key);
             rows.push(TreeRow::Folder { key: key.clone(), name, depth, open });
             if open {
-                level(&inside, depth + 1, &key, opened, all_open, rows);
+                level(&inside, depth + 1, &key, is_open, rows);
             }
         }
         leaves.sort_by_key(|(_, name)| name.to_lowercase());
@@ -1898,7 +1945,7 @@ pub(crate) fn tree_rows<'a>(names: &[&'a str], opened: &BTreeSet<String>, scope:
     }
     let items: Vec<(usize, &str)> = names.iter().copied().enumerate().collect();
     let mut rows = Vec::new();
-    level(&items, 0, scope, opened, all_open, &mut rows);
+    level(&items, 0, scope, is_open, &mut rows);
     rows
 }
 
@@ -2058,6 +2105,21 @@ pub(crate) fn ref_chips(refs: &[git::Ref]) -> Vec<(&git::Ref, bool)> {
 /// Returns a tooltip for what the pointer is over: the full date, or all refs when
 /// some are shortened or folded into `+2`.
 #[allow(clippy::too_many_arguments)]
+/// A file in the tree: status badge and name, lined up with the folder rows. The
+/// folders above say where it is, so only a rename's old path is added.
+fn paint_tree_file(p: &Painter, c: &Colors, row: Rect, change: &Change, depth: usize, selected: bool) {
+    let left = row.left() + 26.0 + depth as f32 * 18.0;
+    w::status_badge(p, pos2(left, row.center().y), change.index, c);
+    let (_, name) = split_path(&change.path);
+    let fg = if selected { c.on_secondary_container } else { c.on_surface };
+    let right = row.right() - 8.0;
+    let mut x = left + 18.0;
+    x += w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(right, row.bottom())), name, theme::body(13.0), fg) + 8.0;
+    if let Some(orig) = &change.orig {
+        w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(right, row.bottom())), &format!("\u{2190} {orig}"), theme::body(12.0), c.on_surface_variant);
+    }
+}
+
 fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool, now: i64, one_remote: bool, pointer: Option<Pos2>) -> Option<String> {
     const MAX_CHIPS: usize = 2;
     let fg = if selected { c.on_secondary_container } else { c.on_surface };

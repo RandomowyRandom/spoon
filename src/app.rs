@@ -458,6 +458,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        #[cfg(all(windows, target_pointer_width = "64"))]
+        crate::dpi_drag::guard_windows();
         let full = ui.max_rect();
         ui.painter().rect_filled(full, 0.0, self.colors.surface_container);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), 60.0));

@@ -4,6 +4,8 @@ mod app;
 mod conflict;
 mod dialogs;
 mod diff;
+#[cfg(all(windows, target_pointer_width = "64"))]
+mod dpi_drag;
 mod git;
 mod graph;
 mod icon;
