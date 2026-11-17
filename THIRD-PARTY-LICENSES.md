@@ -13,8 +13,8 @@ Spoon is MIT licensed (see `LICENSE`). It includes or builds on the following.
 
 - **Source**: https://github.com/JetBrains/JetBrainsMono
 - **License**: SIL Open Font License, Version 1.1
-- **License link**: https://github.com/JetBrains/JetBrainsMono/blob/v2.304/OFL.txt
-- **File**: `assets/fonts/JetBrainsMonoNL-Regular.ttf`
+- **License text**: `assets/fonts/OFL.txt` (installed as `JetBrainsMono-OFL.txt`)
+- **File**: `assets/fonts/JetBrainsMonoNL-Regular.ttf`, embedded in the executable
 
 ## Material Symbols
 

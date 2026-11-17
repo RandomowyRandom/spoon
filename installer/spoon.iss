@@ -15,6 +15,7 @@ AppId={{10FB3B53-28CB-40E7-A073-37D840B6C851}
 AppName=Spoon
 AppVersion={#AppVersion}
 AppPublisher=Spoon contributors
+AppPublisherURL=https://github.com/RandomowyRandom/spoon
 DefaultDirName={autopf}\Spoon
 DisableProgramGroupPage=yes
 ; Per-user by default (no admin prompt); the first page lets the user pick all users.
@@ -40,6 +41,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\THIRD-PARTY-LICENSES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\assets\fonts\OFL.txt"; DestDir: "{app}"; DestName: "JetBrainsMono-OFL.txt"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Spoon"; Filename: "{app}\spoon.exe"

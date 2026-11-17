@@ -1,12 +1,28 @@
 # Spoon
 
-<img src="assets/spoon.svg" width="96" alt="Spoon logo">
+![Spoon: a Git client with a commit graph, written in Rust](assets/card.png)
+
+[![CI](https://github.com/RandomowyRandom/spoon/actions/workflows/ci.yml/badge.svg)](https://github.com/RandomowyRandom/spoon/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/RandomowyRandom/spoon)](https://github.com/RandomowyRandom/spoon/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/RandomowyRandom/spoon)](LICENSE)
 
 A Git GUI client written in Rust, with a Material 3 Expressive interface.
 Spoon is a from-scratch rewrite of [SourceGit](https://github.com/sourcegit-scm/sourcegit) (C#/Avalonia).
 It runs on Windows and Linux.
 
-![Spoon](assets/screenshot.png)
+![Spoon showing a commit graph, commit details and a diff](assets/screenshot.png)
+
+## Install
+
+**Windows:** download `Spoon-<version>-x64-setup.exe` from the
+[latest release](https://github.com/RandomowyRandom/spoon/releases/latest) and run it.
+The installer is not code signed, so SmartScreen shows a warning: choose "More info",
+then "Run anyway".
+
+**Linux:** build from source, see [Build and run](#build-and-run). There is no prebuilt
+binary yet.
+
+Spoon drives the `git` command line, so Git must be installed.
 
 ## What it does
 

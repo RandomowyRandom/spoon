@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 description = "Git GUI client with a Material 3 Expressive interface"
 license = "MIT"
+repository = "https://github.com/RandomowyRandom/spoon"
 
 [dependencies]
 eframe = "0.37.0"
