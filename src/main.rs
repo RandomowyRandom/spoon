@@ -8,6 +8,7 @@ mod git;
 mod graph;
 mod icon;
 mod merge_editor;
+mod open_in;
 mod prefs;
 mod repo;
 mod theme;

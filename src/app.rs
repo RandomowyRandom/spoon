@@ -57,6 +57,10 @@ impl App {
         let colors = Colors::build(&prefs.theme, system_dark);
         theme::apply(ctx, &colors);
         ctx.set_zoom_factor(prefs.zoom.clamp(0.6, 2.0));
+        // Finding installed editors takes a moment; have it done before the menu is opened.
+        std::thread::spawn(|| {
+            crate::open_in::targets();
+        });
         let (clone_tx, clone_rx) = channel();
         let mut app = Self {
             prefs,

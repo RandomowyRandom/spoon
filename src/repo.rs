@@ -16,6 +16,7 @@ use crate::diff::{self, Diff, LineKind};
 use crate::git::{self, Branch, Change, Commit, ConflictSide, DiffSpec, InProgress, LogQuery, Op, OpResult, RefKind, SearchBy, Snapshot, Stash, short};
 use crate::graph::{self, DotKind, Graph};
 use crate::merge_editor::{Action, MergeEditor};
+use crate::open_in;
 use crate::theme::{self, Colors, shape};
 use crate::widgets::{self as w, Kind, ic};
 
@@ -699,9 +700,8 @@ impl RepoView {
                 self.dialog = Some(dialogs::create_tag("HEAD".into(), "the current commit"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if w::icon_btn(ic::FOLDER_OPEN, "Open in file manager").show(ui).clicked() {
-                    ctx.open_url(egui::OpenUrl::new_tab(format!("file://{}", self.path.display())));
-                }
+                let open_in = w::btn("Open in").icon(ic::OPEN_IN).kind(Kind::Text).show(ui);
+                egui::Popup::menu(&open_in).show(|ui| self.open_in_menu(ui, &ctx, snap));
                 if let Some(title) = self.busy {
                     let (spot, _) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::hover());
                     w::loading_indicator(ui, spot.center(), 11.0);
@@ -709,6 +709,34 @@ impl RepoView {
                 }
             });
         });
+    }
+
+    /// Terminals and the file manager, the editors found on this machine, and the
+    /// repository's page on its remote host.
+    fn open_in_menu(&mut self, ui: &mut Ui, ctx: &Context, snap: &Snapshot) {
+        let mut editors = false;
+        for target in open_in::targets() {
+            let icon = match target.kind {
+                open_in::Kind::Terminal => ic::TERMINAL,
+                open_in::Kind::Files => ic::FOLDER_OPEN,
+                open_in::Kind::Editor => ic::CODE,
+            };
+            if target.kind == open_in::Kind::Editor && !std::mem::replace(&mut editors, true) {
+                w::menu_separator(ui);
+            }
+            if w::menu_item(ui, icon, &target.name)
+                && let Err(reason) = target.open(&self.path)
+            {
+                self.notify(reason, true, ctx);
+            }
+        }
+        let remote = snap.remotes.iter().find(|r| r.name == "origin").or(snap.remotes.first());
+        if let Some(web) = remote.and_then(|r| open_in::web_url(&r.url)) {
+            w::menu_separator(ui);
+            if w::menu_item(ui, ic::WEB, &format!("View on {}", open_in::site_name(&web))) {
+                ctx.open_url(egui::OpenUrl::new_tab(web));
+            }
+        }
     }
 
     // ------------------------------------------------------------ sidebar

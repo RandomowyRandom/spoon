@@ -39,6 +39,9 @@ Spoon drives the `git` command line, so Git must be installed.
 - Worktrees: add, remove, prune
 - Multi-select in the sidebar (Ctrl or Shift click) with batch delete for branches,
   remote branches, tags and worktrees
+- Open in: a terminal, Git Bash, the file manager, and the editors found on the machine
+  (VS Code, Cursor, Zed, Sublime Text, Visual Studio, JetBrains IDEs and others), plus
+  the repository's page on GitHub, GitLab or its own host
 - Unified diff viewer, file history, blame, command log
 - Clone, init, tabs for several repositories, submodule list
 
@@ -120,6 +123,7 @@ Preferences are stored in `%APPDATA%\Spoon\preference.json` on Windows and in
 | `src/dialogs.rs` | Operation dialogs |
 | `src/conflict.rs` | Merge conflict model: parse markers, pick lines, render |
 | `src/merge_editor.rs` | Conflict editor UI |
+| `src/open_in.rs` | Finds installed terminals and editors, opens the repository in them |
 | `src/app.rs` | Tabs, welcome page, clone, appearance settings |
 | `src/icon.rs` | The logo, generated in code (`spoon --export-logo assets`) |
 | `src/tests.rs` | Git workflow tests |

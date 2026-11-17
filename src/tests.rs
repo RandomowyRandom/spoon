@@ -1403,6 +1403,39 @@ fn history_rows_stay_short() {
     assert_eq!(chips, [own("main", true), own("topic", false), own("v1", false), own("origin/other", false)]);
 }
 
+#[test]
+fn open_in_finds_web_pages_and_installed_ides() {
+    use crate::open_in::{jetbrains, site_name, visual_studio_name, web_url};
+    let page = |remote: &str| web_url(remote).unwrap_or_default();
+    // Every way git writes a remote leads to the same page.
+    for remote in ["git@github.com:me/repo.git", "https://github.com/me/repo.git", "https://token@github.com/me/repo/", "ssh://git@github.com:22/me/repo", "git://github.com/me/repo.git"] {
+        assert_eq!(page(remote), "https://github.com/me/repo", "{remote}");
+    }
+    assert_eq!(page("http://git.local:3000/team/repo.git"), "http://git.local:3000/team/repo", "a web port is kept");
+    assert_eq!(page("git@gitlab.example.com:group/sub/repo.git"), "https://gitlab.example.com/group/sub/repo");
+    // Local remotes have no page.
+    for remote in [r"C:\work\repo.git", "C:/work/repo", "../repo", "/srv/git/repo.git", "file:///srv/git/repo.git", ""] {
+        assert_eq!(web_url(remote), None, "{remote}");
+    }
+    assert_eq!([site_name("https://github.com/me/repo"), site_name("https://gitlab.com/a/b"), site_name("https://bitbucket.org/a/b")], ["GitHub", "GitLab", "Bitbucket"]);
+    assert_eq!(site_name("http://git.local:3000/team/repo"), "git.local:3000");
+
+    // JetBrains Toolbox lists its IDEs in state.json; entries missing a part are skipped.
+    let state = r#"{"tools": [
+        {"productCode": "RD", "displayName": "Rider", "installLocation": "/opt/rider", "launchCommand": "bin/rider.sh"},
+        {"displayName": "Broken", "installLocation": "", "launchCommand": "bin/x"},
+        {"displayName": "No launcher", "installLocation": "/opt/y"}
+    ]}"#;
+    assert_eq!(jetbrains(state), [("Rider".to_string(), PathBuf::from("/opt/rider").join("bin/rider.sh"))]);
+    assert!(jetbrains("not json").is_empty() && jetbrains("{}").is_empty() && jetbrains("").is_empty());
+
+    assert_eq!(visual_studio_name(Path::new(r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\devenv.exe")), "Visual Studio 2022");
+    assert_eq!(visual_studio_name(Path::new(r"C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\devenv.exe")), "Visual Studio");
+
+    // Whatever this machine has, detection finishes and names everything it found.
+    assert!(crate::open_in::targets().iter().all(|target| !target.name.is_empty()));
+}
+
 // ---------------------------------------------------------------- remotes
 
 #[test]

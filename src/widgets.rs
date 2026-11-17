@@ -38,6 +38,9 @@ pub mod ic {
     pub const FOLDER_OPEN: &str = ICON_FOLDER_OPEN.codepoint;
     pub const NEW_FOLDER: &str = ICON_CREATE_NEW_FOLDER.codepoint;
     pub const TERMINAL: &str = ICON_TERMINAL.codepoint;
+    pub const OPEN_IN: &str = ICON_OPEN_IN_NEW.codepoint;
+    pub const CODE: &str = ICON_CODE.codepoint;
+    pub const WEB: &str = ICON_PUBLIC.codepoint;
     pub const REFRESH: &str = ICON_REFRESH.codepoint;
     pub const COPY: &str = ICON_CONTENT_COPY.codepoint;
     pub const EXPAND: &str = ICON_EXPAND_MORE.codepoint;
