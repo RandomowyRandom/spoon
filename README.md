@@ -43,6 +43,21 @@ cargo run --release -- /path/to/repository
 
 On Linux, install the launcher entry with `assets/spoon.desktop` and `assets/spoon.svg`.
 
+## Windows installer
+
+Needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`).
+
+```sh
+cargo build --release
+iscc installer\spoon.iss
+```
+
+This writes `target\installer\Spoon-<version>-x64-setup.exe`. The installer takes its
+version from `Cargo.toml`, installs per user without an admin prompt (or for all users
+on request), adds a Start menu entry and an uninstaller, and warns when Git is missing.
+The exe links the C runtime statically (`.cargo/config.toml`), so no VC++ redistributable
+is needed. The installer is not code signed, so Windows SmartScreen will warn on download.
+
 ## Tests
 
 ```sh

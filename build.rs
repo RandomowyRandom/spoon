@@ -13,6 +13,9 @@ fn main() {
         std::fs::write(&path, icon::ico(&[16, 24, 32, 48, 64, 256])).expect("write icon");
         winresource::WindowsResource::new()
             .set_icon(path.to_str().expect("utf-8 OUT_DIR"))
+            // Shown by Task Manager and read by the installer script.
+            .set("ProductName", "Spoon")
+            .set("FileDescription", "Spoon")
             .compile()
             .expect("embed icon resource");
     }
