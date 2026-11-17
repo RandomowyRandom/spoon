@@ -77,7 +77,9 @@ fn main() -> eframe::Result {
         .with_inner_size([1360.0, 860.0])
         .with_min_inner_size([980.0, 620.0])
         .with_icon(window_icon());
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    // The window's size, place and maximized state are kept next to the preferences.
+    let persistence_path = prefs::config_dir().map(|dir| dir.join("window.ron"));
+    let options = eframe::NativeOptions { viewport, persist_window: true, persistence_path, ..Default::default() };
     let open = args.first().map(PathBuf::from);
     eframe::run_native("Spoon", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, open)))))
 }

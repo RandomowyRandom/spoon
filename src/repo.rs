@@ -121,7 +121,6 @@ pub struct RepoView {
     search: String,
     search_by: SearchBy,
     filter: String,
-    open: [bool; 5],
     /// The conflict editor, in its own window while a file is being resolved.
     merge: Option<MergeEditor>,
     /// After a file is resolved, open the next conflicted one when the snapshot arrives.
@@ -156,9 +155,8 @@ pub struct RepoView {
     diff_spec: Option<DiffSpec>,
     diff: Option<Arc<Diff>>,
     diff_title: String,
-    sidebar_w: f32,
-    files_w: f32,
-    split: f32,
+    /// Pane sizes and open sections; the app copies the shared layout in each frame.
+    pub layout: crate::prefs::Layout,
 }
 
 /// `2026-01-31 12:00:59 +0100` -> `2026-01-31 12:00`, matching commit dates.
@@ -194,7 +192,6 @@ impl RepoView {
             search: String::new(),
             search_by: SearchBy::Message,
             filter: String::new(),
-            open: [true, true, false, true, true],
             merge: None,
             merge_next: false,
             sides: None,
@@ -219,9 +216,7 @@ impl RepoView {
             diff_spec: None,
             diff: None,
             diff_title: String::new(),
-            sidebar_w: 280.0,
-            files_w: 360.0,
-            split: 0.52,
+            layout: crate::prefs::Layout::default(),
         };
         view.reload(ctx);
         view
@@ -645,10 +640,10 @@ impl RepoView {
         let content = Rect::from_min_max(pos2(rail.right(), rect.top()), rect.max - vec2(GAP + 2.0, GAP + 2.0));
         self.rail(ui, rail, &snap);
 
-        self.sidebar_w = self.sidebar_w.clamp(200.0, (content.width() - 520.0).max(200.0));
-        let sidebar = Rect::from_min_size(content.min, vec2(self.sidebar_w, content.height()));
+        self.layout.sidebar = self.layout.sidebar.clamp(200.0, (content.width() - 520.0).max(200.0));
+        let sidebar = Rect::from_min_size(content.min, vec2(self.layout.sidebar, content.height()));
         let gap = Rect::from_min_size(pos2(sidebar.right(), content.top()), vec2(GAP, content.height()));
-        self.sidebar_w += w::splitter(ui, self.id("sidebar-split"), gap, true);
+        self.layout.sidebar += w::splitter(ui, self.id("sidebar-split"), gap, true);
         self.sidebar(ui, sidebar, &snap);
 
         let main = Rect::from_min_max(pos2(gap.right(), content.top()), content.max);
@@ -814,7 +809,7 @@ impl RepoView {
         };
 
         let locals: Vec<&Branch> = snap.branches.iter().filter(|b| b.remote.is_none() && shown(&b.name)).collect();
-        if w::section_header(ui, "Branches", locals.len(), Some(&mut self.open[0]), Some((ic::ADD, "New branch"))) {
+        if w::section_header(ui, "Branches", locals.len(), Some(&mut self.layout.sections[0]), Some((ic::ADD, "New branch"))) {
             self.dialog = Some(dialogs::create_branch("HEAD".into(), "the current commit"));
         }
         // The current branch leads the list with its full name, outside the folders,
@@ -823,10 +818,10 @@ impl RepoView {
         let names: Vec<&str> = locals.iter().map(|b| b.name.as_str()).collect();
         let rows = tree_rows(&names, "local", &|key| filtering || self.opened.contains(key));
         let order: Vec<String> = current.iter().map(|b| b.name.clone()).chain(leaves(&rows, &locals)).collect();
-        for branch in current.iter().take(visible(self.open[0])) {
+        for branch in current.iter().take(visible(self.layout.sections[0])) {
             self.local_branch_row(ui, ctx, snap, c, branch, &branch.name, 0, &order);
         }
-        for row in rows.iter().take(visible(self.open[0])) {
+        for row in rows.iter().take(visible(self.layout.sections[0])) {
             match row {
                 TreeRow::Leaf { index, name, depth } => self.local_branch_row(ui, ctx, snap, c, locals[*index], name, *depth, &order),
                 TreeRow::Folder { key, name, depth, open } => {
@@ -836,7 +831,7 @@ impl RepoView {
             }
         }
 
-        if w::section_header(ui, "Remotes", snap.remotes.len(), Some(&mut self.open[1]), Some((ic::ADD, "Add remote"))) {
+        if w::section_header(ui, "Remotes", snap.remotes.len(), Some(&mut self.layout.sections[1]), Some((ic::ADD, "Add remote"))) {
             self.dialog = Some(dialogs::add_remote(snap.remotes.is_empty()));
         }
         // Every remote is a folder of its own. All trees are built first, so a
@@ -862,7 +857,7 @@ impl RepoView {
             })
             .collect();
         let order: Vec<String> = trees.iter().flat_map(|tree| leaves(&tree.rows, &tree.branches)).collect();
-        for tree in trees.iter().take(visible(self.open[1])) {
+        for tree in trees.iter().take(visible(self.layout.sections[1])) {
             let remote = tree.remote;
             let count = tree.branches.len().to_string();
             let resp = fold_row(ui, c, 0, ic::CLOUD, c.on_surface_variant, &remote.name, true, tree.open, Trail::Text(if tree.open { "" } else { &count }));
@@ -894,9 +889,9 @@ impl RepoView {
 
         // ponytail: plain (non-virtualised) rows; cap the tag list, raise or virtualise if repos need more.
         let tags: Vec<&git::Tag> = snap.tags.iter().filter(|t| shown(&t.name)).take(300).collect();
-        w::section_header(ui, "Tags", snap.tags.len(), Some(&mut self.open[2]), None);
+        w::section_header(ui, "Tags", snap.tags.len(), Some(&mut self.layout.sections[2]), None);
         let order: Vec<String> = tags.iter().map(|t| t.name.clone()).collect();
-        for tag in tags.iter().take(visible(self.open[2])) {
+        for tag in tags.iter().take(visible(self.layout.sections[2])) {
             let marked = self.is_marked(Group::Tag, &tag.name);
             let resp = side_row(ui, c, 0, ic::TAG, c.on_surface_variant, &tag.name, false, marked, Trail::Text(""));
             if resp.clicked() && !self.mark(ui, Group::Tag, &order, &tag.name) {
@@ -909,10 +904,10 @@ impl RepoView {
         }
 
         if !snap.submodules.is_empty() {
-            if w::section_header(ui, "Submodules", snap.submodules.len(), Some(&mut self.open[3]), Some((ic::REFRESH, "Update submodules"))) {
+            if w::section_header(ui, "Submodules", snap.submodules.len(), Some(&mut self.layout.sections[3]), Some((ic::REFRESH, "Update submodules"))) {
                 self.run(ctx, vec![Op::SubmoduleUpdate]);
             }
-            for module in snap.submodules.iter().take(visible(self.open[3])) {
+            for module in snap.submodules.iter().take(visible(self.layout.sections[3])) {
                 let resp = side_row(ui, c, 0, ic::SUBMODULE, c.on_surface_variant, module, false, false, Trail::Text(""));
                 if resp.double_clicked() {
                     self.open_request = Some(self.path.join(module));
@@ -921,11 +916,11 @@ impl RepoView {
             }
         }
 
-        if w::section_header(ui, "Worktrees", snap.worktrees.len(), Some(&mut self.open[4]), Some((ic::ADD, "Add worktree"))) {
+        if w::section_header(ui, "Worktrees", snap.worktrees.len(), Some(&mut self.layout.sections[4]), Some((ic::ADD, "Add worktree"))) {
             self.dialog = Some(dialogs::add_worktree(&self.path, None));
         }
         let order: Vec<String> = snap.worktrees.iter().map(|t| t.path.clone()).collect();
-        for tree in snap.worktrees.iter().take(visible(self.open[4])) {
+        for tree in snap.worktrees.iter().take(visible(self.layout.sections[4])) {
             let (_, name) = split_path(&tree.path);
             let here = Path::new(&tree.path) == self.path;
             let (trail, tip) = if tree.prunable {
@@ -1238,10 +1233,10 @@ impl RepoView {
         if shown == 0.0 {
             return (rect, None);
         }
-        let split_h = (rect.height() * self.split).clamp(120.0, (rect.height() - 200.0).max(120.0));
+        let split_h = (rect.height() * self.layout.split).clamp(120.0, (rect.height() - 200.0).max(120.0));
         let list = Rect::from_min_size(rect.min, vec2(rect.width(), egui::lerp(rect.height()..=split_h, shown)));
         let gap = Rect::from_min_size(pos2(rect.left(), list.bottom()), vec2(rect.width(), GAP));
-        self.split += w::splitter(ui, self.id("list-split"), gap, false) / rect.height().max(1.0);
+        self.layout.split += w::splitter(ui, self.id("list-split"), gap, false) / rect.height().max(1.0);
         // Full size from the start, so the cards slide rather than stretch.
         let detail = Rect::from_min_size(pos2(rect.left(), gap.bottom()), vec2(rect.width(), rect.height() - split_h - GAP));
         (list, Some(detail))
@@ -1355,10 +1350,10 @@ impl RepoView {
     // ------------------------------------------------------------ detail cards
 
     fn split_files(&mut self, ui: &Ui, salt: &str, rect: Rect) -> (Rect, Rect) {
-        self.files_w = self.files_w.clamp(220.0, (rect.width() - 280.0).max(220.0));
-        let left = Rect::from_min_size(rect.min, vec2(self.files_w, rect.height()));
+        self.layout.files = self.layout.files.clamp(220.0, (rect.width() - 280.0).max(220.0));
+        let left = Rect::from_min_size(rect.min, vec2(self.layout.files, rect.height()));
         let gap = Rect::from_min_size(pos2(left.right(), rect.top()), vec2(GAP, rect.height()));
-        self.files_w += w::splitter(ui, self.id(salt), gap, true);
+        self.layout.files += w::splitter(ui, self.id(salt), gap, true);
         (left, Rect::from_min_max(pos2(gap.right(), rect.top()), rect.max))
     }
 

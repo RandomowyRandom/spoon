@@ -42,6 +42,8 @@ pub struct App {
     clone_rx: Receiver<(PathBuf, OpResult)>,
     notice: Option<(String, bool)>,
     focused: bool,
+    /// Preferences changed in memory and are not on disk yet.
+    dirty: bool,
 }
 
 fn home_dir() -> String {
@@ -77,6 +79,7 @@ impl App {
             clone_rx,
             notice: None,
             focused: true,
+            dirty: false,
         };
         for path in app.prefs.open.clone().into_iter().chain(open) {
             app.open_repo(ctx, &path);
@@ -88,6 +91,7 @@ impl App {
 
     fn save_prefs(&mut self) {
         self.prefs.open = self.repos.iter().map(|r| r.path.clone()).collect();
+        self.dirty = false;
         if let Err(reason) = self.prefs.save() {
             self.notice = Some((reason, true));
         }
@@ -190,7 +194,9 @@ impl App {
                 changed = true;
             }
         }
-        if changed {
+        // Written once the mouse is up, so dragging a splitter is one write, not hundreds.
+        self.dirty |= changed;
+        if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
             self.save_prefs();
         }
         // Files may have changed while another window had focus.
@@ -455,6 +461,15 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Called on exit and now and then: eframe stores the window and egui's memory, we
+    /// flush preferences. egui's memory must be kept too: it holds the zoom, which eframe
+    /// needs before the window exists to restore its size in the right unit.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        if self.dirty {
+            self.save_prefs();
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
@@ -466,7 +481,14 @@ impl eframe::App for App {
         let body = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         self.top_bar(ui, bar);
         match self.active.filter(|i| *i < self.repos.len()) {
-            Some(index) => self.repos[index].ui(ui, body),
+            Some(index) => {
+                // One layout for every tab: hand it to the tab shown, take back what it changed.
+                let repo = &mut self.repos[index];
+                repo.layout = self.prefs.layout;
+                repo.ui(ui, body);
+                self.dirty |= repo.layout != self.prefs.layout;
+                self.prefs.layout = repo.layout;
+            }
             None => self.welcome(ui, body),
         }
         for repo in &mut self.repos {

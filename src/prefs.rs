@@ -20,11 +20,32 @@ pub struct Prefs {
     pub zoom: f32,
     /// Branch folders left open in the sidebar, by repository path.
     pub open_folders: BTreeMap<String, BTreeSet<String>>,
+    pub layout: Layout,
+}
+
+/// How the panes are arranged. One layout serves every tab.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layout {
+    /// Width of the sidebar.
+    pub sidebar: f32,
+    /// Width of the file list beside a diff.
+    pub files: f32,
+    /// Share of the height the list gets above the details.
+    pub split: f32,
+    /// Open sidebar sections: branches, remotes, tags, submodules, worktrees.
+    pub sections: [bool; 5],
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Self { sidebar: 280.0, files: 360.0, split: 0.52, sections: [true, true, false, true, true] }
+    }
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new() }
+        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new(), layout: Layout::default() }
     }
 }
 

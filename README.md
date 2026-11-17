@@ -109,7 +109,9 @@ on Android, every color comes from one source color:
 Ctrl with plus, minus or 0 changes the size of the whole interface; the choice is remembered.
 
 Preferences are stored in `%APPDATA%\Spoon\preference.json` on Windows and in
-`$XDG_CONFIG_HOME/spoon/preference.json` (or `~/.config/spoon`) on Linux.
+`$XDG_CONFIG_HOME/spoon/preference.json` (or `~/.config/spoon`) on Linux. They include
+the pane sizes and which sidebar sections are open. The window's size, place and
+maximized state are kept beside them in `window.ron`.
 
 ## Layout of the code
 
