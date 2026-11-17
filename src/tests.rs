@@ -166,6 +166,12 @@ fn subjects(repo: &Path) -> Vec<String> {
     log(repo).into_iter().map(|c| c.subject).collect()
 }
 
+/// Subject of HEAD. Unlike `subjects(..)[0]` this does not depend on how git orders
+/// unrelated branch tips committed within the same second.
+fn head_subject(repo: &Path) -> String {
+    g(repo, &["log", "-1", "--format=%s"])
+}
+
 fn change<'a>(changes: &'a [Change], path: &str) -> &'a Change {
     changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("no change for {path} in {changes:?}"))
 }
@@ -623,7 +629,7 @@ fn cherry_pick_plain_conflicting_and_merge_commits() {
     commit(&repo, "a.txt", "main a\n", "main a");
 
     op(&repo, Op::CherryPick { sha: pick.clone(), mainline: false });
-    assert_eq!(subjects(&repo)[0], "pick me");
+    assert_eq!(head_subject(&repo), "pick me");
     assert_ne!(sha(&repo, "HEAD"), pick, "cherry-pick creates a new commit");
     assert_eq!(read(&repo, "b.txt"), "b\n");
 
@@ -1069,8 +1075,8 @@ fn log_decorations_search_and_limits() {
 
     let commits = log(&repo);
     assert_eq!(commits.len(), 4);
-    let top = &commits[0];
-    assert!(top.is_head && top.subject == "write docs");
+    let top = commits.iter().find(|c| c.is_head).unwrap();
+    assert_eq!(top.subject, "write docs");
     assert_eq!(top.refs, [git::Ref { kind: RefKind::Head, name: "main".into() }]);
     assert_eq!(top.parents.len(), 1);
     assert_eq!((top.author.as_str(), top.email.as_str()), ("Spoon Test", "test@spoon.invalid"));
