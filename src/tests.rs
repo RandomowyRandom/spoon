@@ -1331,9 +1331,9 @@ fn branches_group_into_folders_by_prefix() {
     use crate::repo::{TreeRow, tree_rows};
     let names = ["main", "develop", "feat/anims/Value", "feat/anims/Animation", "feat/twin/x", "feat/workstation-setup", "backup/pre-split", "Hotfix-1.2.1", "feat/anims-rebase-a01"];
     // Compact form: depth, then "+name" open folder, "-name" closed folder, or a branch's full name.
-    let show = |collapsed: &[&str], all_open: bool| -> Vec<String> {
-        let collapsed = collapsed.iter().map(|k| k.to_string()).collect();
-        tree_rows(&names, &collapsed, "local", all_open)
+    let show = |opened: &[&str], all_open: bool| -> Vec<String> {
+        let opened = opened.iter().map(|k| k.to_string()).collect();
+        tree_rows(&names, &opened, "local", all_open)
             .iter()
             .map(|row| match row {
                 TreeRow::Folder { name, depth, open, .. } => format!("{depth}{}{name}", if *open { '+' } else { '-' }),
@@ -1351,25 +1351,56 @@ fn branches_group_into_folders_by_prefix() {
         "0+feat", "1+anims", "2 feat/anims/Animation", "2 feat/anims/Value", "1+twin", "2 feat/twin/x", "1 feat/anims-rebase-a01", "1 feat/workstation-setup",
         "0 develop", "0 Hotfix-1.2.1", "0 main",
     ];
-    assert_eq!(show(&[], false), expected);
+    let all = ["local/backup", "local/feat", "local/feat/anims", "local/feat/twin"];
+    assert_eq!(show(&all, false), expected);
 
-    // A folded folder keeps its row and hides everything under it.
-    assert_eq!(show(&["local/feat"], false), ["0+backup", "1 backup/pre-split", "0-feat", "0 develop", "0 Hotfix-1.2.1", "0 main"]);
-    let nested = show(&["local/feat/anims"], false);
+    // Folders start closed: a closed folder keeps its row and hides everything under it.
+    let closed = ["0-backup", "0-feat", "0 develop", "0 Hotfix-1.2.1", "0 main"];
+    assert_eq!(show(&[], false), closed);
+    assert_eq!(show(&["local/backup", "local/feat/anims", "local/feat/twin"], false), ["0+backup", "1 backup/pre-split", "0-feat", "0 develop", "0 Hotfix-1.2.1", "0 main"], "an open folder inside a closed one stays hidden");
+    let nested = show(&["local/feat", "local/feat/twin"], false);
     assert!(nested.contains(&"1-anims".to_string()) && nested.contains(&"2 feat/twin/x".to_string()) && !nested.iter().any(|r| r.contains("Animation")));
-    // Another tree's folders do not fold this one; filtering opens everything.
-    assert_eq!(show(&["remote/origin/feat"], false), expected);
-    assert_eq!(show(&["local/feat", "local/backup"], true), expected);
+    // Another tree's folders do not open this one; filtering opens everything.
+    assert_eq!(show(&["remote/origin/feat"], false), closed);
+    assert_eq!(show(&[], true), expected);
 
     // Keys name the folder's full path, so equal names at different places fold apart.
-    let keys: Vec<String> = tree_rows(&names, &Default::default(), "remote/origin", false).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
+    let keys: Vec<String> = tree_rows(&names, &Default::default(), "remote/origin", true).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
     assert_eq!(keys, ["remote/origin/backup", "remote/origin/feat", "remote/origin/feat/anims", "remote/origin/feat/twin"]);
 
     // Odd names never loop or vanish: every branch still appears exactly once.
     let odd = ["a//b", "/lead", "trail/", "//", "", "x/y/z/w"];
-    let mut seen: Vec<usize> = tree_rows(&odd, &Default::default(), "local", false).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
+    let mut seen: Vec<usize> = tree_rows(&odd, &Default::default(), "local", true).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
     seen.sort();
     assert_eq!(seen, [0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn history_rows_stay_short() {
+    use crate::repo::{ago, clip_name, ref_chips};
+    // Relative time, in the fewest characters; a plain day once it is over a year old.
+    let label = |secs: i64| ago(1_000_000_000 - secs, 1_000_000_000, "2001-09-09 01:46");
+    assert_eq!([label(0), label(59), label(60), label(3_599)], ["now", "now", "1 min", "59 min"]);
+    assert_eq!([label(3_600), label(86_399), label(86_400), label(13 * 86_400)], ["1 h", "23 h", "1 d", "13 d"]);
+    assert_eq!([label(14 * 86_400), label(364 * 86_400), label(365 * 86_400)], ["2 wk", "52 wk", "2001-09-09"]);
+    assert_eq!(label(-500), "now", "a clock ahead of ours is not a negative age");
+
+    // The log carries the time those labels are computed from.
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    commit(&repo, "a.txt", "a\n", "first");
+    assert!(log(&repo)[0].time > 1_600_000_000);
+
+    // Long names keep both ends; short ones and non-ASCII ones are left whole or cut on characters.
+    assert_eq!(clip_name("main"), "main");
+    assert_eq!(clip_name("fix/Bug-Hunt-Edit-Receipts"), "fix/Bug-H\u{2026}Edit-Receipts");
+    assert_eq!(clip_name("\u{17c}\u{f3}\u{142}\u{107}-".repeat(6).as_str()).chars().count(), 23);
+
+    // A remote branch on the same commit as its local one folds into that chip.
+    let refs = git::parse_commits("a\0\0HEAD -> refs/heads/main, tag: refs/tags/v1, refs/remotes/origin/main, refs/remotes/origin/other, refs/heads/topic\0n\0e\0d\x001\0s\n").remove(0).refs;
+    let chips: Vec<(String, bool)> = ref_chips(&refs).into_iter().map(|(r, synced)| (r.name.clone(), synced)).collect();
+    let own = |name: &str, synced: bool| (name.to_string(), synced);
+    assert_eq!(chips, [own("main", true), own("topic", false), own("v1", false), own("origin/other", false)]);
 }
 
 // ---------------------------------------------------------------- remotes

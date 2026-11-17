@@ -56,6 +56,7 @@ impl App {
         let system_dark = ctx.system_theme() != Some(egui::Theme::Light);
         let colors = Colors::build(&prefs.theme, system_dark);
         theme::apply(ctx, &colors);
+        ctx.set_zoom_factor(prefs.zoom.clamp(0.6, 2.0));
         let (clone_tx, clone_rx) = channel();
         let mut app = Self {
             prefs,
@@ -101,7 +102,8 @@ impl App {
         self.active = Some(match self.repos.iter().position(|r| r.path == root) {
             Some(index) => index,
             None => {
-                self.repos.push(RepoView::new(root.clone(), self.prefs.history_limit, ctx));
+                let folders = self.prefs.open_folders.get(&root.display().to_string()).cloned().unwrap_or_default();
+                self.repos.push(RepoView::new(root.clone(), self.prefs.history_limit, folders, ctx));
                 self.repos.len() - 1
             }
         });
@@ -173,6 +175,19 @@ impl App {
         }
         for path in requests {
             self.open_repo(ctx, &path);
+        }
+        // Remember the zoom (Ctrl with plus or minus) and which branch folders are open.
+        let mut changed = ctx.zoom_factor() != self.prefs.zoom;
+        self.prefs.zoom = ctx.zoom_factor();
+        for repo in &self.repos {
+            let stored = self.prefs.open_folders.entry(repo.path.display().to_string()).or_default();
+            if *stored != repo.opened {
+                stored.clone_from(&repo.opened);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_prefs();
         }
         // Files may have changed while another window had focus.
         let focused = ctx.input(|i| i.focused);

@@ -1,5 +1,6 @@
 //! User preferences, stored as JSON in the platform config directory.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,15 @@ pub struct Prefs {
     /// Tabs to restore on start.
     pub open: Vec<PathBuf>,
     pub history_limit: usize,
+    /// UI scale. Ctrl with plus, minus or 0 changes it.
+    pub zoom: f32,
+    /// Branch folders left open in the sidebar, by repository path.
+    pub open_folders: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000 }
+        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new() }
     }
 }
 

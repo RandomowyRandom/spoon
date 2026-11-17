@@ -29,7 +29,8 @@ Spoon drives the `git` command line, so Git must be installed.
 - Commit graph with branches, tags and remote refs; search by message, author, file or content
 - Local changes: stage, unstage, discard, commit, amend, sign off, commit and push
 - Branches: create, check out, rename, delete, track remote branches; shown as a
-  foldable tree grouped by their `/` prefixes (`feat/…`, `fix/…`)
+  foldable tree grouped by their `/` prefixes (`feat/…`, `fix/…`), with the current
+  branch on top and folders closed until opened
 - Merge (default, no fast-forward, fast-forward only, squash), rebase, cherry-pick, revert, reset
 - Conflict editor in its own window: pick single lines from either side, edit the result,
   then continue, skip or abort; whole-file "use ours" and "use theirs" as well
@@ -100,6 +101,8 @@ on Android, every color comes from one source color:
 - source color: presets or any custom color
 - palette style: tonal spot, vibrant, expressive, neutral, rainbow, fruit salad, monochrome
 - contrast: standard, medium or high
+
+Ctrl with plus, minus or 0 changes the size of the whole interface; the choice is remembered.
 
 Preferences are stored in `%APPDATA%\Spoon\preference.json` on Windows and in
 `$XDG_CONFIG_HOME/spoon/preference.json` (or `~/.config/spoon`) on Linux.

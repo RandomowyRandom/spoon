@@ -109,8 +109,9 @@ pub struct RepoView {
     sides: Option<(String, Option<ConflictInfo>)>,
     /// The conflict panel's checkboxes: take current, take incoming.
     take: (bool, bool),
-    /// Folded branch folders, by key: `local/feat/anims`, `remote/origin`, `remote/origin/fix`.
-    collapsed: BTreeSet<String>,
+    /// Branch folders left open, by key: `local/feat/anims`, `remote/origin`, `remote/origin/fix`.
+    /// Folders start closed, so a repository with many branches opens calm.
+    pub opened: BTreeSet<String>,
     /// Multi-selected sidebar rows of `mark_group`: branch or tag names, worktree paths.
     marked: BTreeSet<String>,
     mark_group: Group,
@@ -145,7 +146,7 @@ fn split_path(path: &str) -> (&str, &str) {
 }
 
 impl RepoView {
-    pub fn new(path: PathBuf, history_limit: usize, ctx: &Context) -> Self {
+    pub fn new(path: PathBuf, history_limit: usize, opened: BTreeSet<String>, ctx: &Context) -> Self {
         let (tx, rx) = channel();
         let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
         let mut view = Self {
@@ -173,7 +174,7 @@ impl RepoView {
             merge_next: false,
             sides: None,
             take: (true, true),
-            collapsed: BTreeSet::new(),
+            opened,
             marked: BTreeSet::new(),
             mark_group: Group::Local,
             anchor: None,
@@ -466,6 +467,12 @@ impl RepoView {
         });
     }
 
+    /// Closes the details, giving the list its full height back.
+    fn deselect(&mut self) {
+        (self.selected, self.stash) = (None, None);
+        self.clear_detail();
+    }
+
     fn select_commit(&mut self, ctx: &Context, commit: &Commit) {
         self.selected = Some(commit.sha.clone());
         self.load_detail(ctx, commit.sha.clone(), git::base_of(commit), Some(commit.clone()), None);
@@ -590,8 +597,13 @@ impl RepoView {
         if ui.input(|i| i.key_pressed(Key::F5)) {
             self.reload(&ctx);
         }
-        if self.dialog.is_none() && ui.input(|i| i.key_pressed(Key::Escape)) {
-            self.marked.clear();
+        // Esc backs out one step: first the sidebar selection, then the open details.
+        let overlay = self.dialog.is_some() || self.show_log || self.text_view.is_some();
+        if !overlay && ui.input(|i| i.key_pressed(Key::Escape)) {
+            match self.marked.is_empty() {
+                true if self.page != Page::Changes => self.deselect(),
+                _ => self.marked.clear(),
+            }
         }
         let Some(snap) = self.snap.clone() else {
             w::loading_indicator(ui, rect.center(), 26.0);
@@ -746,17 +758,21 @@ impl RepoView {
         if w::section_header(ui, "Branches", locals.len(), Some(&mut self.open[0]), Some((ic::ADD, "New branch"))) {
             self.dialog = Some(dialogs::create_branch("HEAD".into(), "the current commit"));
         }
+        // The current branch leads the list with its full name, outside the folders,
+        // so it is never hunted for.
+        let (current, locals): (Vec<&Branch>, Vec<&Branch>) = locals.into_iter().partition(|b| b.current);
         let names: Vec<&str> = locals.iter().map(|b| b.name.as_str()).collect();
-        let rows = tree_rows(&names, &self.collapsed, "local", filtering);
-        let order = leaves(&rows, &locals);
+        let rows = tree_rows(&names, &self.opened, "local", filtering);
+        let order: Vec<String> = current.iter().map(|b| b.name.clone()).chain(leaves(&rows, &locals)).collect();
+        for branch in current.iter().take(visible(self.open[0])) {
+            self.local_branch_row(ui, ctx, snap, c, branch, &branch.name, 0, &order);
+        }
         for row in rows.iter().take(visible(self.open[0])) {
             match row {
                 TreeRow::Leaf { index, name, depth } => self.local_branch_row(ui, ctx, snap, c, locals[*index], name, *depth, &order),
                 TreeRow::Folder { key, name, depth, open } => {
-                    let inside: Vec<&Branch> = folder_members(key, "local", &names).into_iter().map(|i| locals[i]).collect();
-                    let holds_current = inside.iter().any(|b| b.current);
-                    let members = inside.iter().map(|b| b.name.clone()).collect();
-                    self.folder_row(ui, c, key, name, *depth, *open, Group::Local, members, holds_current);
+                    let members = folder_members(key, "local", &names).into_iter().map(|i| locals[i].name.clone()).collect();
+                    self.folder_row(ui, c, key, name, *depth, *open, Group::Local, members);
                 }
             }
         }
@@ -779,19 +795,20 @@ impl RepoView {
             .iter()
             .map(|remote| {
                 let key = format!("remote/{}", remote.name);
-                let open = filtering || !self.collapsed.contains(&key);
+                let open = filtering || self.opened.contains(&key);
                 let branches: Vec<&Branch> = snap.branches.iter().filter(|b| b.remote.as_deref() == Some(&remote.name) && shown(&b.name)).collect();
                 let short: Vec<&str> = branches.iter().map(|b| b.name.get(remote.name.len() + 1..).unwrap_or(&b.name)).collect();
-                let rows = if open { tree_rows(&short, &self.collapsed, &key, filtering) } else { Vec::new() };
+                let rows = if open { tree_rows(&short, &self.opened, &key, filtering) } else { Vec::new() };
                 RemoteTree { remote, key, open, branches, short, rows }
             })
             .collect();
         let order: Vec<String> = trees.iter().flat_map(|tree| leaves(&tree.rows, &tree.branches)).collect();
         for tree in trees.iter().take(visible(self.open[1])) {
             let remote = tree.remote;
-            let resp = fold_row(ui, c, 0, ic::CLOUD, c.on_surface_variant, &remote.name, true, tree.open, Trail::Text(""));
+            let count = tree.branches.len().to_string();
+            let resp = fold_row(ui, c, 0, ic::CLOUD, c.on_surface_variant, &remote.name, true, tree.open, Trail::Text(if tree.open { "" } else { &count }));
             if resp.clicked() {
-                toggle(&mut self.collapsed, &tree.key);
+                toggle(&mut self.opened, &tree.key);
             }
             resp.context_menu(|ui| {
                 if w::menu_item(ui, ic::FETCH, "Fetch") {
@@ -810,7 +827,7 @@ impl RepoView {
                     TreeRow::Leaf { index, name, depth } => self.remote_branch_row(ui, ctx, snap, c, tree.branches[*index], name, depth + 1, &order, &remote.name),
                     TreeRow::Folder { key, name, depth, open } => {
                         let members = folder_members(key, &tree.key, &tree.short).into_iter().map(|i| tree.branches[i].name.clone()).collect();
-                        self.folder_row(ui, c, key, name, depth + 1, *open, Group::Remote, members, false);
+                        self.folder_row(ui, c, key, name, depth + 1, *open, Group::Remote, members);
                     }
                 }
             }
@@ -983,15 +1000,13 @@ impl RepoView {
     }
 
     /// A foldable folder of branches. A click folds it; its menu selects what is inside.
-    /// A closed folder holding the current branch is highlighted, so it is not lost.
     #[allow(clippy::too_many_arguments)]
-    fn folder_row(&mut self, ui: &mut Ui, c: &Colors, key: &str, name: &str, depth: usize, open: bool, group: Group, members: Vec<String>, holds_current: bool) {
+    fn folder_row(&mut self, ui: &mut Ui, c: &Colors, key: &str, name: &str, depth: usize, open: bool, group: Group, members: Vec<String>) {
         let count = members.len().to_string();
-        let hides_current = holds_current && !open;
-        let (icon, tint) = (if open { ic::FOLDER_OPEN } else { ic::FOLDER }, if hides_current { c.primary } else { c.on_surface_variant });
-        let resp = fold_row(ui, c, depth, icon, tint, name, hides_current, open, Trail::Text(if open { "" } else { &count }));
+        let icon = if open { ic::FOLDER_OPEN } else { ic::FOLDER };
+        let resp = fold_row(ui, c, depth, icon, c.on_surface_variant, name, false, open, Trail::Text(if open { "" } else { &count }));
         if resp.clicked() {
-            toggle(&mut self.collapsed, key);
+            toggle(&mut self.opened, key);
         }
         resp.context_menu(|ui| {
             if w::menu_item(ui, ic::STAGE_ALL, &format!("Select all {} inside", members.len())) {
@@ -1156,19 +1171,29 @@ impl RepoView {
 
     // ------------------------------------------------------------ history
 
-    /// Top card with a list, bottom row with the file list and diff cards.
-    fn list_and_detail(&mut self, ui: &mut Ui, rect: Rect) -> (Rect, Rect) {
-        let list_h = (rect.height() * self.split).clamp(120.0, (rect.height() - 200.0).max(120.0));
-        let list = Rect::from_min_size(rect.min, vec2(rect.width(), list_h));
+    /// The list card, and the area for the file list and diff cards under it. The list
+    /// has the whole height until something is picked; then the details slide up.
+    fn list_and_detail(&mut self, ui: &mut Ui, rect: Rect) -> (Rect, Option<Rect>) {
+        let picked = self.detail.is_some() || self.wanted.is_some();
+        let shown = ui.ctx().animate_bool_with_time(self.id("detail-shown"), picked, 0.18);
+        if shown == 0.0 {
+            return (rect, None);
+        }
+        let split_h = (rect.height() * self.split).clamp(120.0, (rect.height() - 200.0).max(120.0));
+        let list = Rect::from_min_size(rect.min, vec2(rect.width(), egui::lerp(rect.height()..=split_h, shown)));
         let gap = Rect::from_min_size(pos2(rect.left(), list.bottom()), vec2(rect.width(), GAP));
         self.split += w::splitter(ui, self.id("list-split"), gap, false) / rect.height().max(1.0);
-        (list, Rect::from_min_max(pos2(rect.left(), gap.bottom()), rect.max))
+        // Full size from the start, so the cards slide rather than stretch.
+        let detail = Rect::from_min_size(pos2(rect.left(), gap.bottom()), vec2(rect.width(), rect.height() - split_h - GAP));
+        (list, Some(detail))
     }
 
     fn history_page(&mut self, ui: &mut Ui, rect: Rect, snap: &Snapshot) {
         let (list, detail) = self.list_and_detail(ui, rect);
         self.history_list(ui, list, snap);
-        self.detail_cards(ui, detail, (ic::COMMIT, "No commit selected", "Pick a commit to see what changed"));
+        if let Some(detail) = detail {
+            self.detail_cards(ui, detail);
+        }
     }
 
     fn history_list(&mut self, ui: &mut Ui, rect: Rect, snap: &Snapshot) {
@@ -1212,6 +1237,8 @@ impl RepoView {
         }
         let graph = self.graph.clone();
         let scroll_to = self.scroll_to.take();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        let one_remote = snap.remotes.len() == 1;
         w::rows(ui, "history-rows", body, ROW, snap.commits.len(), scroll_to, |ui, range| {
             let origin = pos2(ui.max_rect().left() + 4.0, ui.max_rect().top() - range.start as f32 * ROW);
             for i in range.clone() {
@@ -1219,12 +1246,18 @@ impl RepoView {
                 let (row, resp) = w::row(ui, ROW);
                 let selected = self.selected.as_deref() == Some(commit.sha.as_str());
                 w::row_bg(ui, row, &resp, selected);
-                if resp.clicked() {
-                    self.select_commit(&ctx, commit);
+                // A second click on the picked commit closes its details.
+                match (resp.clicked(), selected) {
+                    (true, true) => self.deselect(),
+                    (true, false) => self.select_commit(&ctx, commit),
+                    _ => {}
                 }
                 resp.context_menu(|ui| self.commit_menu(ui, &ctx, snap, commit));
                 let margin = graph.margins.get(i).copied().unwrap_or(10.0);
-                paint_commit_row(ui.painter(), &c, row, commit, margin, selected);
+                let tip = paint_commit_row(ui.painter(), &c, row, commit, margin, selected, now, one_remote, resp.hover_pos());
+                if let Some(tip) = tip {
+                    resp.on_hover_text(tip);
+                }
             }
             paint_graph(ui.painter(), &graph, &c, origin, &range);
         });
@@ -1270,20 +1303,23 @@ impl RepoView {
         (left, Rect::from_min_max(pos2(gap.right(), rect.top()), rect.max))
     }
 
-    fn detail_cards(&mut self, ui: &mut Ui, rect: Rect, empty: (&str, &str, &str)) {
+    fn detail_cards(&mut self, ui: &mut Ui, rect: Rect) {
         let c = w::colors(ui);
         let Some(detail) = self.detail.clone() else {
+            // Loading, or sliding away after being closed.
             w::card(ui, rect, c.surface, CARD);
             if self.wanted.is_some() {
                 w::loading_indicator(ui, rect.center(), 22.0);
-            } else {
-                w::empty_state(ui, rect, empty.0, empty.1, empty.2);
             }
             return;
         };
         let (left, right) = self.split_files(ui, "detail-split", rect);
         self.files_card(ui, left, &detail);
         self.diff_card(ui, right);
+        let close = Rect::from_min_size(pos2(left.right() - 40.0, left.top() + 10.0), vec2(30.0, 30.0));
+        if w::icon_btn(ic::CLOSE, "Close details (Esc)").size(30.0).show_at(ui, self.id("close-detail"), close).clicked() {
+            self.deselect();
+        }
     }
 
     fn files_card(&mut self, ui: &mut Ui, rect: Rect, detail: &Detail) {
@@ -1296,7 +1332,7 @@ impl RepoView {
 
         if let Some(commit) = &detail.commit {
             w::avatar(&p, pos2(inner.left() + 22.0, y + 24.0), 17.0, &commit.author, &c);
-            let text = Rect::from_min_max(pos2(inner.left() + 48.0, y + 4.0), pos2(inner.right(), y + 24.0));
+            let text = Rect::from_min_max(pos2(inner.left() + 48.0, y + 4.0), pos2(inner.right() - 34.0, y + 24.0));
             w::label_in(&p, text, &commit.author, theme::emph(14.0), c.on_surface);
             let sub = format!("{}  \u{00b7}  {}", commit.email, commit.date);
             w::label_in(&p, text.translate(vec2(0.0, 20.0)), &sub, theme::body(12.0), c.on_surface_variant);
@@ -1323,7 +1359,7 @@ impl RepoView {
         } else if let Some(stash) = &detail.stash {
             w::cookie(&p, pos2(inner.left() + 22.0, y + 24.0), 18.0, 6.0, 0.08, 0.0, c.tertiary_container);
             w::icon_at(&p, pos2(inner.left() + 22.0, y + 24.0), ic::STASH, 18.0, c.on_tertiary_container);
-            let text = Rect::from_min_max(pos2(inner.left() + 48.0, y + 4.0), pos2(inner.right(), y + 24.0));
+            let text = Rect::from_min_max(pos2(inner.left() + 48.0, y + 4.0), pos2(inner.right() - 34.0, y + 24.0));
             w::label_in(&p, text, &stash.name, theme::emph(14.0), c.on_surface);
             w::label_in(&p, text.translate(vec2(0.0, 20.0)), minutes(&stash.date), theme::body(12.0), c.on_surface_variant);
             y += 54.0;
@@ -1732,7 +1768,9 @@ impl RepoView {
                 });
             }
         });
-        self.detail_cards(ui, detail, (ic::STASH, "No stash selected", "Pick a stash to see what it holds"));
+        if let Some(detail) = detail {
+            self.detail_cards(ui, detail);
+        }
     }
 
     // ------------------------------------------------------------ overlays
@@ -1807,10 +1845,10 @@ pub(crate) enum TreeRow<'a> {
 }
 
 /// Lays branch names out as a tree by their `/` separated parts: at each level the
-/// folders come first, then the branches, both alphabetical. Folders in `collapsed`
-/// are listed closed, without their contents, unless `all_open`.
-pub(crate) fn tree_rows<'a>(names: &[&'a str], collapsed: &BTreeSet<String>, scope: &str, all_open: bool) -> Vec<TreeRow<'a>> {
-    fn level<'a>(items: &[(usize, &'a str)], depth: usize, path: &str, collapsed: &BTreeSet<String>, all_open: bool, rows: &mut Vec<TreeRow<'a>>) {
+/// folders come first, then the branches, both alphabetical. Folders are listed
+/// closed, without their contents, unless they are in `opened` or `all_open` is set.
+pub(crate) fn tree_rows<'a>(names: &[&'a str], opened: &BTreeSet<String>, scope: &str, all_open: bool) -> Vec<TreeRow<'a>> {
+    fn level<'a>(items: &[(usize, &'a str)], depth: usize, path: &str, opened: &BTreeSet<String>, all_open: bool, rows: &mut Vec<TreeRow<'a>>) {
         let mut folders: std::collections::BTreeMap<(String, &'a str), Vec<(usize, &'a str)>> = Default::default();
         let mut leaves: Vec<(usize, &'a str)> = Vec::new();
         for &(index, rest) in items {
@@ -1821,10 +1859,10 @@ pub(crate) fn tree_rows<'a>(names: &[&'a str], collapsed: &BTreeSet<String>, sco
         }
         for ((_, name), inside) in folders {
             let key = format!("{path}/{name}");
-            let open = all_open || !collapsed.contains(&key);
+            let open = all_open || opened.contains(&key);
             rows.push(TreeRow::Folder { key: key.clone(), name, depth, open });
             if open {
-                level(&inside, depth + 1, &key, collapsed, all_open, rows);
+                level(&inside, depth + 1, &key, opened, all_open, rows);
             }
         }
         leaves.sort_by_key(|(_, name)| name.to_lowercase());
@@ -1832,7 +1870,7 @@ pub(crate) fn tree_rows<'a>(names: &[&'a str], collapsed: &BTreeSet<String>, sco
     }
     let items: Vec<(usize, &str)> = names.iter().copied().enumerate().collect();
     let mut rows = Vec::new();
-    level(&items, 0, scope, collapsed, all_open, &mut rows);
+    level(&items, 0, scope, opened, all_open, &mut rows);
     rows
 }
 
@@ -1945,24 +1983,78 @@ fn paint_change_row(p: &Painter, c: &Colors, row: Rect, change: &Change, status:
     w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(right, row.bottom())), &dir, theme::body(12.0), c.on_surface_variant);
 }
 
-fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool) {
+/// How long ago, in few characters: `now`, `26 min`, `3 h`, `5 d`, `7 wk`. Past a
+/// year it is the day itself, taken from `date` (`2024-03-02 12:00`).
+pub(crate) fn ago(time: i64, now: i64, date: &str) -> String {
+    let secs = (now - time).max(0);
+    match secs {
+        0..60 => "now".into(),
+        60..3_600 => format!("{} min", secs / 60),
+        3_600..86_400 => format!("{} h", secs / 3_600),
+        86_400..1_209_600 => format!("{} d", secs / 86_400),
+        1_209_600..31_536_000 => format!("{} wk", secs / 604_800),
+        _ => date.get(..10).unwrap_or(date).to_string(),
+    }
+}
+
+/// Keeps both ends of a long name: `fix/Bug-Hunt-Edit-Receipts` -> `fix/Bug-H…Edit-Receipts`.
+pub(crate) fn clip_name(name: &str) -> std::borrow::Cow<'_, str> {
+    const HEAD: usize = 9;
+    const TAIL: usize = 13;
+    let count = name.chars().count();
+    if count <= HEAD + TAIL + 1 {
+        return name.into();
+    }
+    let head: String = name.chars().take(HEAD).collect();
+    let tail: String = name.chars().skip(count - TAIL).collect();
+    format!("{head}\u{2026}{tail}").into()
+}
+
+/// The refs worth a chip, most telling first, and whether each local one has its
+/// remote twin on the same commit. A twin gets no chip of its own.
+pub(crate) fn ref_chips(refs: &[git::Ref]) -> Vec<(&git::Ref, bool)> {
+    let local = |r: &git::Ref| matches!(r.kind, RefKind::Head | RefKind::Local);
+    let twin_of = |r: &git::Ref| refs.iter().find(|l| local(l) && r.kind == RefKind::Remote && r.name.split_once('/').is_some_and(|(_, rest)| rest == l.name));
+    let rank = |r: &git::Ref| match r.kind {
+        RefKind::Head => 0,
+        RefKind::Local => 1,
+        RefKind::Tag => 2,
+        RefKind::Remote => 3,
+    };
+    let mut chips: Vec<(&git::Ref, bool)> = refs.iter().filter(|r| twin_of(r).is_none()).map(|r| (r, refs.iter().any(|t| twin_of(t) == Some(r)))).collect();
+    chips.sort_by_key(|(r, _)| rank(r));
+    chips
+}
+
+/// Paints one history row. The subject is the loud part; everything else is quiet.
+/// Returns a tooltip for what the pointer is over: the full date, or all refs when
+/// some are shortened or folded into `+2`.
+#[allow(clippy::too_many_arguments)]
+fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool, now: i64, one_remote: bool, pointer: Option<Pos2>) -> Option<String> {
+    const MAX_CHIPS: usize = 2;
     let fg = if selected { c.on_secondary_container } else { c.on_surface };
     let dim = if selected { c.on_secondary_container } else { c.on_surface_variant };
+    let faint = if selected { c.on_secondary_container } else { c.outline };
     let mid = row.center().y;
-    let date = Rect::from_min_max(pos2(row.right() - 124.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
-    let sha = Rect::from_min_size(pos2(date.left() - 88.0, row.top()), vec2(84.0, row.height()));
-    let author_w = if row.width() > 760.0 { 150.0 } else { 0.0 };
+    let date = Rect::from_min_max(pos2(row.right() - 84.0, row.top()), pos2(row.right() - 10.0, row.bottom()));
+    let sha = Rect::from_min_size(pos2(date.left() - 62.0, row.top()), vec2(58.0, row.height()));
+    let author_w = if row.width() > 760.0 { 140.0 } else { 0.0 };
     let author = Rect::from_min_size(pos2(sha.left() - author_w - 8.0, row.top()), vec2(author_w, row.height()));
-    w::label_in(p, date, &commit.date, theme::body(12.5), dim);
-    w::label_in(p, sha, short(&commit.sha), theme::mono(12.0), dim);
+    p.text(pos2(date.right(), mid), Align2::RIGHT_CENTER, ago(commit.time, now, &commit.date), theme::body(12.0), dim);
+    // Seven characters, as git abbreviates; the details card has the longer form to copy.
+    w::label_in(p, sha, commit.sha.get(..7).unwrap_or(&commit.sha), theme::mono(11.5), faint);
     if author_w > 0.0 {
-        w::avatar(p, pos2(author.left() + 9.0, mid), 9.0, &commit.author, c);
-        w::label_in(p, author.with_min_x(author.left() + 24.0), &commit.author, theme::body(13.0), dim);
+        w::avatar(p, pos2(author.left() + 9.0, mid), 8.0, &commit.author, c);
+        w::label_in(p, author.with_min_x(author.left() + 23.0), &commit.author, theme::body(12.5), dim);
     }
 
-    let mut x = row.left() + 4.0 + margin + 6.0;
+    let start = row.left() + 4.0 + margin + 6.0;
+    let mut x = start;
     let subject_right = author.left() - 10.0;
-    for r in &commit.refs {
+    let chips = ref_chips(&commit.refs);
+    let mut drawn = 0;
+    let mut shortened = false;
+    for (r, synced) in chips.iter().take(MAX_CHIPS) {
         if x > subject_right - 140.0 {
             break;
         }
@@ -1972,10 +2064,28 @@ fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin:
             RefKind::Remote => (ic::CLOUD, c.surface_highest, c.on_surface_variant),
             RefKind::Tag => (ic::TAG, c.tertiary_container, c.on_tertiary_container),
         };
-        x += w::chip(p, pos2(x, mid), icon, &r.name, fill, on) + 5.0;
+        // The cloud already says "remote": with one remote its name adds nothing.
+        let name = match (r.kind == RefKind::Remote && one_remote, r.name.split_once('/')) {
+            (true, Some((_, rest))) => rest,
+            _ => r.name.as_str(),
+        };
+        let label = clip_name(name);
+        shortened |= label.len() != r.name.len();
+        x += w::chip_with(p, pos2(x, mid), icon, &label, if *synced { ic::CLOUD } else { "" }, fill, on) + 5.0;
+        drawn += 1;
+    }
+    if drawn < chips.len() {
+        x += w::chip_with(p, pos2(x, mid), "", &format!("+{}", chips.len() - drawn), "", c.surface_highest, c.on_surface_variant) + 5.0;
     }
     let font = if commit.is_head { theme::emph(13.5) } else { theme::body(13.5) };
     w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(subject_right, row.bottom())), &commit.subject, font, fg);
+
+    let over = |from: f32, to: f32| pointer.is_some_and(|at| (from..to).contains(&at.x));
+    if over(date.left(), row.right()) {
+        return Some(commit.date.clone());
+    }
+    let hidden = shortened || drawn < chips.len() || chips.len() < commit.refs.len();
+    (hidden && over(start, x)).then(|| commit.refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>().join("\n"))
 }
 
 fn paint_graph(p: &Painter, graph: &Graph, c: &Colors, origin: Pos2, rows: &Range<usize>) {

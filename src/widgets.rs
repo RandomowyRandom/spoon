@@ -443,12 +443,24 @@ pub fn section_header(ui: &mut Ui, title: &str, count: usize, open: Option<&mut 
 
 /// Small rounded label (branch, tag, remote ref). Returns its width.
 pub fn chip(p: &Painter, left_center: Pos2, icon: &str, text: &str, fill: Color32, fg: Color32) -> f32 {
+    chip_with(p, left_center, icon, text, "", fill, fg)
+}
+
+/// A chip with a second icon after its text; `trail` is empty for none. `icon` may be empty too.
+pub fn chip_with(p: &Painter, left_center: Pos2, icon: &str, text: &str, trail: &str, fill: Color32, fg: Color32) -> f32 {
     let font = theme::emph(11.5);
-    let w = text_width(p, text, font.clone()) + 30.0;
+    let text_w = text_width(p, text, font.clone());
+    let lead = if icon.is_empty() { 8.0 } else { 22.0 };
+    let w = lead + text_w + 8.0 + if trail.is_empty() { 0.0 } else { 15.0 };
     let rect = Rect::from_min_size(left_center - vec2(0.0, 10.0), vec2(w, 20.0));
     p.rect_filled(rect, radius(shape::SMALL), fill);
-    icon_at(p, pos2(rect.left() + 12.0, rect.center().y), icon, 13.0, fg);
-    p.text(pos2(rect.left() + 22.0, rect.center().y), Align2::LEFT_CENTER, text, font, fg);
+    if !icon.is_empty() {
+        icon_at(p, pos2(rect.left() + 12.0, rect.center().y), icon, 13.0, fg);
+    }
+    p.text(pos2(rect.left() + lead, rect.center().y), Align2::LEFT_CENTER, text, font, fg);
+    if !trail.is_empty() {
+        icon_at(p, pos2(rect.right() - 12.0, rect.center().y), trail, 12.0, fg);
+    }
     w
 }
 

@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 const LOG_FORMAT: &str =
-    "--format=%H%x00%P%x00%D%x00%aN%x00%aE%x00%ad%x00%s";
+    "--format=%H%x00%P%x00%D%x00%aN%x00%aE%x00%ad%x00%at%x00%s";
 const DATE_FORMAT: &str = "--date=format-local:%Y-%m-%d %H:%M";
 const DIFF_COMMON: [&str; 4] = ["--no-color", "--no-ext-diff", "--patch", "--unified=4"];
 
@@ -85,6 +85,8 @@ pub struct Commit {
     pub author: String,
     pub email: String,
     pub date: String,
+    /// Author time in seconds since the Unix epoch, for "3 h ago" labels.
+    pub time: i64,
     pub subject: String,
     pub is_head: bool,
 }
@@ -263,7 +265,7 @@ pub fn parse_commits(out: &str) -> Vec<Commit> {
     out.lines()
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\0').collect();
-            if f.len() != 7 {
+            if f.len() != 8 {
                 return None;
             }
             let refs = parse_refs(f[2]);
@@ -275,7 +277,8 @@ pub fn parse_commits(out: &str) -> Vec<Commit> {
                 author: f[3].into(),
                 email: f[4].into(),
                 date: f[5].into(),
-                subject: f[6].into(),
+                time: f[6].parse().unwrap_or(0),
+                subject: f[7].into(),
             })
         })
         .collect()
