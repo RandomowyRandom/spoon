@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Spoon
+Comment=Git client with a commit graph
+Exec=spoon %f
+Icon=spoon
+Terminal=false
+Type=Application
+Categories=Development;RevisionControl;
+MimeType=inode/directory;
