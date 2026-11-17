@@ -158,7 +158,9 @@ fn visual_studio() -> Vec<(String, PathBuf)> {
 
 /// `...\Microsoft Visual Studio\2022\Community\...\devenv.exe` -> `Visual Studio 2022`.
 pub(crate) fn visual_studio_name(exe: &Path) -> String {
-    let year = exe.iter().filter_map(|part| part.to_str()).find(|part| part.len() == 4 && part.bytes().all(|b| b.is_ascii_digit()));
+    // Split by hand: a Windows path has no components for `Path` on other systems.
+    let text = exe.to_string_lossy();
+    let year = text.split(['\\', '/']).find(|part| part.len() == 4 && part.bytes().all(|b| b.is_ascii_digit()));
     year.map_or_else(|| "Visual Studio".to_string(), |year| format!("Visual Studio {year}"))
 }
 
