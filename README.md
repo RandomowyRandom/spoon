@@ -44,10 +44,12 @@ Spoon drives the `git` command line, so Git must be installed.
   the repository's page on GitHub, GitLab or its own host
 - Unified diff viewer, a commit's changed files as a folder tree, file history, blame,
   command log
+- External diff tool: open any diff in Beyond Compare, WinMerge, KDiff3, Meld, P4Merge,
+  a VS Code family editor, Visual Studio, a JetBrains IDE, or a command of your own
 - Clone, init, tabs for several repositories, submodule list
 
 Not ported from SourceGit yet: interactive rebase, hunk and line staging, launching an
-external merge tool, git-flow, LFS, bisect, image diff, statistics, custom actions,
+external merge tool (an external diff tool is supported), git-flow, LFS, bisect, image diff, statistics, custom actions,
 workspaces, issue links, AI commit messages, translations, per-remote SSH keys.
 
 ## Requirements
@@ -98,7 +100,8 @@ option-like names. The tests ignore your global git config.
 
 ## Appearance
 
-The palette icon in the top bar opens the appearance settings. As with Material You
+The gear icon in the top bar opens Settings in a window of its own. Its Appearance
+section has a preview of the choice in light and in dark. As with Material You
 on Android, every color comes from one source color:
 
 - theme: system, light or dark
@@ -128,7 +131,7 @@ maximized state are kept beside them in `window.ron`.
 | `src/merge_editor.rs` | Conflict editor UI |
 | `src/open_in.rs` | Finds installed terminals and editors, opens the repository in them |
 | `src/dpi_drag.rs` | Windows: keeps a window dragged between screens of different scaling from jumping |
-| `src/app.rs` | Tabs, welcome page, clone, appearance settings |
+| `src/app.rs` | Tabs, welcome page, clone, settings window |
 | `src/icon.rs` | The logo, generated in code (`spoon --export-logo assets`) |
 | `src/tests.rs` | Git workflow tests |
 

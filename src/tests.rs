@@ -1435,6 +1435,42 @@ fn open_in_finds_web_pages_and_installed_ides() {
     assert!(crate::open_in::targets().iter().all(|target| !target.name.is_empty()));
 }
 
+#[test]
+fn diff_goes_to_an_external_program() {
+    use crate::open_in::{DiffTool, editor_diff_args};
+    // The command is one a POSIX shell reads: forward slashes, the path in single quotes.
+    let tool = DiffTool::new("Code", PathBuf::from(r"C:\Program Files\It's Code\Code.exe"), &["--wait", "--diff"]);
+    assert_eq!(tool.command(), r"'C:/Program Files/It'\''s Code/Code.exe' --wait --diff");
+    assert_eq!(DiffTool::new("Meld", PathBuf::from("/usr/bin/meld"), &[]).command(), "'/usr/bin/meld'");
+    // Which editors can compare files, and how they are told to.
+    assert_eq!(editor_diff_args("Cursor"), Some(&["--wait", "--diff"][..]));
+    assert_eq!(editor_diff_args("Visual Studio 2022"), Some(&["//diff"][..]));
+    assert_eq!(editor_diff_args("Rider"), Some(&["diff"][..]));
+    assert_eq!([editor_diff_args("Zed"), editor_diff_args("Sublime Text")], [None, None]);
+    assert!(crate::open_in::diff_tools().iter().all(|tool| !tool.command().is_empty()));
+
+    // `cp` stands in for the program: given the old and the new file, it puts the old
+    // content back, which shows it was run with the right two files.
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    let first = commit(&repo, "f.txt", "old\n", "first");
+    write(&repo, "f.txt", "new\n");
+    let unstaged = DiffSpec::Unstaged(change(&git::status(&repo), "f.txt").clone());
+    let shown = git::difftool(&repo, "cp", &unstaged);
+    assert!(shown.ok, "{}", shown.log);
+    assert_eq!(read(&repo, "f.txt"), "old\n");
+
+    // Between two commits both sides are temporary copies; the work tree is not touched.
+    let second = commit(&repo, "f.txt", "newer\n", "second");
+    let revs = DiffSpec::Revs { base: first, rev: second, change: Change { path: "f.txt".into(), index: 'M', ..Default::default() } };
+    assert!(git::difftool(&repo, "cp", &revs).ok);
+    assert_eq!(read(&repo, "f.txt"), "newer\n");
+
+    // A program that is not there is reported, with what the shell said.
+    let missing = git::difftool(&repo, "no-such-diff-program-anywhere", &revs);
+    assert!(!missing.ok && missing.error.contains("not found"), "{}", missing.log);
+}
+
 // ---------------------------------------------------------------- remotes
 
 #[test]

@@ -632,6 +632,21 @@ pub fn diff_args(spec: &DiffSpec) -> Vec<String> {
     a
 }
 
+/// Shows `spec` in an external diff program. `command` is run by git's shell with the
+/// old and the new file added at its end; this returns when the program closes. An
+/// untracked file has no old version and cannot be shown.
+pub fn difftool(repo: &Path, command: &str, spec: &DiffSpec) -> OpResult {
+    let mut args = strings(&["difftool", "--no-prompt"]);
+    args.push(format!("--extcmd={command}"));
+    // The same revisions and paths as the built-in diff, without its output options.
+    args.extend(diff_args(spec).into_iter().skip(1 + DIFF_COMMON.len()));
+    let out = run(repo, &args);
+    // Git does not pass on the program's exit code, and rightly: many return non-zero
+    // for "the files differ". A command the shell could not start shows in its words.
+    let missing = ["not found", "No such file", "cannot execute", "Permission denied"].iter().any(|sign| out.stderr.contains(sign));
+    OpResult { ok: out.ok && !missing, log: format!("$ git {}\n{}{}", args.join(" "), out.stdout, out.stderr), error: out.stderr }
+}
+
 pub fn diff_text(repo: &Path, spec: &DiffSpec) -> String {
     run(repo, &diff_args(spec)).stdout
 }

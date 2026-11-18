@@ -54,6 +54,11 @@ pub mod ic {
     pub const LIGHT: &str = ICON_LIGHT_MODE.codepoint;
     pub const AUTO: &str = ICON_BRIGHTNESS_AUTO.codepoint;
     pub const PALETTE: &str = ICON_PALETTE.codepoint;
+    pub const SETTINGS: &str = ICON_SETTINGS.codepoint;
+    pub const TOOLS: &str = ICON_BUILD.codepoint;
+    pub const COMPARE: &str = ICON_COMPARE.codepoint;
+    pub const RADIO_ON: &str = ICON_RADIO_BUTTON_CHECKED.codepoint;
+    pub const RADIO_OFF: &str = ICON_RADIO_BUTTON_UNCHECKED.codepoint;
     pub const WARNING: &str = ICON_WARNING.codepoint;
     pub const ERROR: &str = ICON_ERROR.codepoint;
     pub const FILE: &str = ICON_DESCRIPTION.codepoint;

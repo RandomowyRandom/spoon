@@ -21,6 +21,22 @@ pub struct Prefs {
     /// Branch folders left open in the sidebar, by repository path.
     pub open_folders: BTreeMap<String, BTreeSet<String>>,
     pub layout: Layout,
+    pub tools: Tools,
+}
+
+/// Programs Spoon hands work to.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tools {
+    /// The diff program: empty for none, the name of one found on this machine, or
+    /// [`Tools::CUSTOM`] for `diff_command`.
+    pub diff_tool: String,
+    /// A command line of the user's own; the old and the new file are added at its end.
+    pub diff_command: String,
+}
+
+impl Tools {
+    pub const CUSTOM: &str = "custom";
 }
 
 /// How the panes are arranged. One layout serves every tab.
@@ -45,7 +61,7 @@ impl Default for Layout {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new(), layout: Layout::default() }
+        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new(), layout: Layout::default(), tools: Tools::default() }
     }
 }
 

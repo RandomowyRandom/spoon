@@ -35,6 +35,76 @@ const EDITORS: [(&str, &str, &[&str]); 7] = [
     ("Sublime Text", r"Sublime Text\sublime_text.exe", &["subl"]),
 ];
 
+/// Programs made for comparing files: name, paths under `Programs` or `Program Files`
+/// on Windows, command names elsewhere, and the arguments that go before the two files.
+const DIFF_TOOLS: [(&str, &[&str], &[&str], &[&str]); 5] = [
+    ("Beyond Compare", &[r"Beyond Compare 5\BComp.exe", r"Beyond Compare 4\BComp.exe"], &["bcompare"], &[]),
+    ("WinMerge", &[r"WinMerge\WinMergeU.exe"], &[], &["-u", "-e"]),
+    ("KDiff3", &[r"KDiff3\bin\kdiff3.exe", r"KDiff3\kdiff3.exe"], &["kdiff3"], &[]),
+    ("Meld", &[r"Meld\Meld.exe"], &["meld"], &[]),
+    ("P4Merge", &[r"Perforce\p4merge.exe"], &["p4merge"], &[]),
+];
+
+/// A program that shows two versions of a file side by side.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiffTool {
+    pub name: String,
+    exe: PathBuf,
+    args: Vec<String>,
+}
+
+impl DiffTool {
+    pub(crate) fn new(name: &str, exe: PathBuf, args: &[&str]) -> Self {
+        Self { name: name.to_string(), exe, args: args.iter().map(|a| a.to_string()).collect() }
+    }
+
+    /// Where the program is installed, to tell two installs of it apart.
+    pub fn location(&self) -> String {
+        self.exe.display().to_string()
+    }
+
+    /// The command line for `git difftool`, which adds the old and the new file at its
+    /// end. Git hands it to a POSIX shell, so the path takes forward slashes and single
+    /// quotes.
+    pub fn command(&self) -> String {
+        let exe = self.exe.display().to_string().replace('\\', "/").replace('\'', r"'\''");
+        std::iter::once(format!("'{exe}'")).chain(self.args.iter().cloned()).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// The arguments that make an editor compare two files, if it can.
+pub(crate) fn editor_diff_args(name: &str) -> Option<&'static [&'static str]> {
+    const CODE_FAMILY: [&str; 5] = ["Visual Studio Code", "VS Code Insiders", "VSCodium", "Cursor", "Windsurf"];
+    if CODE_FAMILY.contains(&name) {
+        // --wait: git removes its temporary files as soon as the program returns.
+        Some(&["--wait", "--diff"])
+    } else if EDITORS.iter().any(|(editor, ..)| *editor == name) {
+        None
+    } else if name.starts_with("Visual Studio") {
+        // Git's shell on Windows rewrites an argument that starts with one slash into
+        // a path; two slashes come out as the single one devenv expects.
+        Some(&["//diff"])
+    } else {
+        Some(&["diff"]) // JetBrains IDEs
+    }
+}
+
+/// The diff programs on this machine: the dedicated ones first, then the editors that
+/// can compare files. Found once, like [`targets`].
+pub fn diff_tools() -> &'static [DiffTool] {
+    static FOUND: OnceLock<Vec<DiffTool>> = OnceLock::new();
+    FOUND.get_or_init(|| {
+        let roots = [env_dir("LOCALAPPDATA").map(|d| d.join("Programs")), env_dir("ProgramFiles"), env_dir("ProgramFiles(x86)")];
+        let installed = |rels: &[&str]| roots.iter().flatten().flat_map(|root| rels.iter().map(move |rel| root.join(rel))).find(|p| p.is_file());
+        let dedicated = DIFF_TOOLS.iter().filter_map(|(name, rels, commands, args)| {
+            let exe = if cfg!(windows) { installed(rels) } else { on_path(commands) };
+            Some(DiffTool::new(name, exe?, args))
+        });
+        let editors = targets().iter().filter(|target| target.kind == Kind::Editor).filter_map(|target| Some(DiffTool::new(&target.name, target.exe.clone(), editor_diff_args(&target.name)?)));
+        dedicated.chain(editors).collect()
+    })
+}
+
 /// Linux terminals, most generic first, with the arguments that set the folder
 /// for those that do not simply start in the current one.
 const TERMINALS: [(&str, &[&str]); 14] = [

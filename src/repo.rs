@@ -78,6 +78,8 @@ enum Msg {
     Diff(u64, Diff),
     LastMessage(String),
     Text(String, String),
+    /// The external diff program, by name, has closed (or could not be started).
+    Tool(String, OpResult),
     /// The conflict editor's file was written and staged (or that failed).
     Resolved(OpResult),
     /// What the conflict panel shows for a file.
@@ -157,6 +159,9 @@ pub struct RepoView {
     diff_title: String,
     /// Pane sizes and open sections; the app copies the shared layout in each frame.
     pub layout: crate::prefs::Layout,
+    /// The diff program picked in Settings: its name and the command git runs. The app
+    /// sets it each frame, like the layout.
+    pub diff_tool: Option<(String, String)>,
 }
 
 /// `2026-01-31 12:00:59 +0100` -> `2026-01-31 12:00`, matching commit dates.
@@ -217,6 +222,7 @@ impl RepoView {
             diff: None,
             diff_title: String::new(),
             layout: crate::prefs::Layout::default(),
+            diff_tool: None,
         };
         view.reload(ctx);
         view
@@ -304,6 +310,14 @@ impl RepoView {
                 Msg::Diff(generation, diff) if generation == self.diff_generation => self.diff = Some(Arc::new(diff)),
                 Msg::LastMessage(message) if self.message.trim().is_empty() => self.message = message,
                 Msg::Text(title, text) => self.text_view = Some((title, text)),
+                Msg::Tool(name, result) => {
+                    self.log += &result.log;
+                    match result.ok {
+                        // The file may have been edited in the program.
+                        true => self.reload(ctx),
+                        false => self.notify(format!("{name} could not be started: {}", result.error.lines().last().unwrap_or("no reason given").trim()), true, ctx),
+                    }
+                }
                 Msg::Resolved(result) => self.on_resolved(ctx, result),
                 Msg::Sides(path, info) => {
                     if let Some(editor) = self.merge.as_mut().filter(|e| e.path == path) {
@@ -584,6 +598,18 @@ impl RepoView {
         self.search_by = SearchBy::Path;
         self.enter(ctx, Page::History);
         self.apply_search(ctx);
+    }
+
+    /// Whether `change` can go to the external diff program: one is picked, and the
+    /// file has an old version to compare with.
+    fn can_diff_externally(&self, change: &Change) -> bool {
+        self.diff_tool.is_some() && !change.untracked()
+    }
+
+    /// Opens the diff in the program picked in Settings, without holding up the window.
+    fn open_in_diff_tool(&mut self, ctx: &Context, spec: DiffSpec) {
+        let Some((name, command)) = self.diff_tool.clone() else { return };
+        self.spawn(ctx, move |repo| Msg::Tool(name, git::difftool(repo, &command, &spec)));
     }
 
     fn blame(&mut self, ctx: &Context, rev: String, path: String) {
@@ -1474,6 +1500,9 @@ impl RepoView {
                     self.pick_file(&ctx, i, change.clone());
                 }
                 resp.context_menu(|ui| {
+                    if self.can_diff_externally(change) && w::menu_item(ui, ic::COMPARE, "Open in diff tool") {
+                        self.open_in_diff_tool(&ctx, DiffSpec::Revs { base: detail.base.clone(), rev: detail.sha.clone(), change: change.clone() });
+                    }
                     if w::menu_item(ui, ic::HISTORY, "File history") {
                         self.file_history(&ctx, &change.path);
                     }
@@ -1506,9 +1535,23 @@ impl RepoView {
         let header = Rect::from_min_size(inner.min, vec2(inner.width(), 36.0));
         let (dir, name) = split_path(&self.diff_title);
         let mut x = header.left() + 10.0;
-        x += w::label_in(&p, Rect::from_min_max(pos2(x, header.top()), header.max - vec2(150.0, 0.0)), name, theme::emph(14.0), c.on_surface) + 10.0;
-        w::label_in(&p, Rect::from_min_max(pos2(x, header.top()), header.max - vec2(110.0, 0.0)), dir, theme::body(12.5), c.on_surface_variant);
-        let stats = p.text(pos2(header.right() - 10.0, header.center().y), Align2::RIGHT_CENTER, format!("\u{2212}{}", diff.deleted), theme::emph(13.0), c.deleted);
+        x += w::label_in(&p, Rect::from_min_max(pos2(x, header.top()), header.max - vec2(190.0, 0.0)), name, theme::emph(14.0), c.on_surface) + 10.0;
+        w::label_in(&p, Rect::from_min_max(pos2(x, header.top()), header.max - vec2(150.0, 0.0)), dir, theme::body(12.5), c.on_surface_variant);
+        // The same diff in the program picked in Settings, when there is one.
+        let external = self.diff_spec.clone().filter(|spec| match spec {
+            DiffSpec::Unstaged(change) | DiffSpec::Staged(change) | DiffSpec::Revs { change, .. } => self.can_diff_externally(change) && !change.conflicted(),
+        });
+        let mut stats_right = header.right() - 10.0;
+        if let Some(spec) = external {
+            let button = Rect::from_center_size(pos2(header.right() - 18.0, header.center().y), vec2(30.0, 30.0));
+            let tip = format!("Open in {}", self.diff_tool.as_ref().map_or("diff tool", |(name, _)| name));
+            if w::icon_btn(ic::COMPARE, &tip).size(30.0).show_at(ui, self.id("diff-tool"), button).clicked() {
+                let ctx = ui.ctx().clone();
+                self.open_in_diff_tool(&ctx, spec);
+            }
+            stats_right = button.left() - 8.0;
+        }
+        let stats = p.text(pos2(stats_right, header.center().y), Align2::RIGHT_CENTER, format!("\u{2212}{}", diff.deleted), theme::emph(13.0), c.deleted);
         p.text(pos2(stats.left() - 8.0, header.center().y), Align2::RIGHT_CENTER, format!("+{}", diff.added), theme::emph(13.0), c.added);
 
         let body = Rect::from_min_max(pos2(inner.left(), header.bottom() + 4.0), inner.max);
@@ -1775,6 +1818,9 @@ impl RepoView {
                         }
                     }
                     w::menu_separator(ui);
+                    if self.can_diff_externally(change) && !change.conflicted() && w::menu_item(ui, ic::COMPARE, "Open in diff tool") {
+                        self.open_in_diff_tool(&ctx, if staged { DiffSpec::Staged(change.clone()) } else { DiffSpec::Unstaged(change.clone()) });
+                    }
                     if w::menu_item(ui, ic::HISTORY, "File history") {
                         self.file_history(&ctx, &change.path);
                     }

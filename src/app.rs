@@ -1,13 +1,14 @@
-//! Application shell: tabs, welcome page, clone/init, appearance settings.
+//! Application shell: tabs, welcome page, clone/init, the settings window.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
-use eframe::egui::{self, Align, Align2, Color32, Context, CursorIcon, Layout, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, pos2, vec2};
+use eframe::egui::{self, Align, Align2, Color32, Context, CornerRadius, CursorIcon, Key, Layout, Painter, Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, Ui, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2};
 
 use crate::git::{self, OpResult};
 use crate::icon;
-use crate::prefs::Prefs;
+use crate::open_in;
+use crate::prefs::{Prefs, Tools};
 use crate::repo::RepoView;
 use crate::theme::{self, Colors, Mode, PaletteStyle, SEEDS, ThemePrefs, shape};
 use crate::widgets::{self as w, Kind, ic};
@@ -35,7 +36,9 @@ pub struct App {
     active: Option<usize>,
     logo: Option<(Color32, TextureHandle)>,
     settings: bool,
-    previews: Option<(ThemePrefs, bool, Vec<Colors>)>,
+    /// Colors for the settings window, kept while the theme they were built from stands:
+    /// one set per palette style, then light and dark.
+    previews: Option<(ThemePrefs, bool, Vec<Colors>, [Colors; 2])>,
     clone_form: Option<CloneForm>,
     cloning: bool,
     clone_tx: Sender<(PathBuf, OpResult)>,
@@ -44,6 +47,19 @@ pub struct App {
     focused: bool,
     /// Preferences changed in memory and are not on disk yet.
     dirty: bool,
+    /// The page the settings window shows.
+    section: Section,
+}
+
+/// The pages of the settings window, in the order of its list.
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    Appearance,
+    Tools,
+}
+
+impl Section {
+    const ALL: [(Section, &str, &str); 2] = [(Section::Appearance, ic::PALETTE, "Appearance"), (Section::Tools, ic::TOOLS, "External tools")];
 }
 
 fn home_dir() -> String {
@@ -80,6 +96,7 @@ impl App {
             notice: None,
             focused: true,
             dirty: false,
+            section: Section::Appearance,
         };
         for path in app.prefs.open.clone().into_iter().chain(open) {
             app.open_repo(ctx, &path);
@@ -237,7 +254,7 @@ impl App {
         let ctx = ui.ctx().clone();
         self.paint_logo(ui, Rect::from_center_size(pos2(rect.left() + 40.0, rect.center().y), vec2(34.0, 34.0)));
 
-        let tabs = Rect::from_min_max(pos2(rect.left() + 80.0, rect.top()), pos2(rect.right() - 108.0, rect.bottom()));
+        let tabs = Rect::from_min_max(pos2(rect.left() + 80.0, rect.top()), pos2(rect.right() - 64.0, rect.bottom()));
         let mut close = None;
         w::hchild(ui, "tabs", tabs, |ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
@@ -269,21 +286,13 @@ impl App {
             self.close_repo(index);
         }
 
-        let actions = Rect::from_min_max(pos2(rect.right() - 104.0, rect.top()), pos2(rect.right() - 12.0, rect.bottom()));
+        let actions = Rect::from_min_max(pos2(rect.right() - 60.0, rect.top()), pos2(rect.right() - 12.0, rect.bottom()));
         w::hchild(ui, "bar-actions", actions, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let (icon, next) = match self.prefs.theme.mode {
-                Mode::System => (ic::AUTO, Mode::Light),
-                Mode::Light => (ic::LIGHT, Mode::Dark),
-                Mode::Dark => (ic::DARK, Mode::System),
-            };
-            if w::icon_btn(icon, "Theme: system, light or dark").show(ui).clicked() {
-                self.prefs.theme.mode = next;
-                self.retheme(&ctx);
-                self.save_prefs();
-            }
-            if w::icon_btn(ic::PALETTE, "Appearance").selected(self.settings).show(ui).clicked() {
-                self.settings = true;
+            if w::icon_btn(ic::SETTINGS, "Settings").selected(self.settings).show(ui).clicked() {
+                // Already open: bring the window forward instead of a second one.
+                if std::mem::replace(&mut self.settings, true) {
+                    ctx.send_viewport_cmd_to(settings_window_id(), ViewportCommand::Focus);
+                }
             }
         });
     }
@@ -394,21 +403,146 @@ impl App {
         }
     }
 
-    fn settings_dialog(&mut self, ctx: &Context) {
-        let c = self.colors;
-        let key = (self.prefs.theme, self.system_dark);
-        if self.previews.as_ref().is_none_or(|(prefs, dark, _)| (*prefs, *dark) != key) {
-            let build = |style| Colors::build(&ThemePrefs { style, ..key.0 }, key.1);
-            self.previews = Some((key.0, key.1, PaletteStyle::ALL.map(build).to_vec()));
+    /// The diff program picked in Settings: its name and the command git runs. `None`
+    /// when none is picked, or the one picked is no longer on this machine.
+    fn diff_tool(&self) -> Option<(String, String)> {
+        let tools = &self.prefs.tools;
+        match tools.diff_tool.as_str() {
+            "" => None,
+            Tools::CUSTOM => Some(("The diff tool".to_string(), tools.diff_command.trim().to_string())).filter(|(_, command)| !command.is_empty()),
+            name => open_in::diff_tools().iter().find(|tool| tool.name == name).map(|tool| (tool.name.clone(), tool.command())),
         }
-        let previews = self.previews.as_ref().map(|(.., list)| list.clone()).unwrap_or_default();
+    }
+
+    /// The settings window: its sections listed down the left, the chosen one beside them.
+    fn settings_window(&mut self, ctx: &Context) {
+        if !self.settings {
+            return;
+        }
+        let builder = ViewportBuilder::default()
+            .with_title("Settings - Spoon")
+            .with_inner_size([1300.0, 640.0])
+            .with_min_inner_size([1260.0, 640.0])
+            .with_icon(crate::window_icon());
+        let close = ctx.show_viewport_immediate(settings_window_id(), builder, |ui, _| {
+            let c = self.colors;
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, 0.0, c.surface_container);
+            let area = rect.shrink(24.0);
+            let list = Rect::from_min_size(area.min, vec2(196.0, area.height()));
+            ui.painter().text(pos2(list.left() + 16.0, list.top() + 32.0), Align2::LEFT_CENTER, "Settings", theme::emph(22.0), c.on_surface);
+            w::child(ui, "settings-sections", list.with_min_y(list.top() + 80.0), |ui| {
+                ui.spacing_mut().item_spacing.y = 4.0;
+                for (section, icon, label) in Section::ALL {
+                    if section_item(ui, &c, icon, label, self.section == section) {
+                        self.section = section;
+                    }
+                }
+            });
+            let page = Rect::from_min_max(pos2(list.right() + 24.0, area.top()), area.max);
+            match self.section {
+                Section::Appearance => self.appearance_page(ui, page),
+                Section::Tools => self.tools_page(ui, page),
+            }
+            ui.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape))
+        });
+        if close {
+            self.settings = false;
+        }
+    }
+
+    /// The programs Spoon hands work to. For now: the one that shows a diff.
+    fn tools_page(&mut self, ui: &mut Ui, area: Rect) {
+        let c = self.colors;
+        let mut tools = self.prefs.tools.clone();
+        page_head(ui, &c, area, ic::TOOLS, "External tools", "Programs Spoon hands a job to. They are found on this computer when Spoon starts.");
+
+        // The card is as tall as what it holds: one setting should not look like an empty form.
+        let column = Rect::from_min_max(pos2(area.left(), area.top() + 80.0), pos2(area.left() + 720.0f32.min(area.width()), area.bottom()));
+        w::child(ui, "tools-diff", column, |ui| {
+            egui::Frame::new().fill(c.surface).corner_radius(w::radius(28.0)).inner_margin(egui::Margin::symmetric(22, 12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let note = |ui: &mut Ui, text: &str| {
+                    ui.label(egui::RichText::new(text).font(theme::body(12.5)).color(c.on_surface_variant));
+                };
+                w::field_label(ui, "Diff tool");
+                note(ui, "Shows a file's changes in another program. Spoon's own diff stays where it is.");
+                ui.add_space(10.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                if choice_row(ui, &c, "None", "Only Spoon's own diff", tools.diff_tool.is_empty()) {
+                    tools.diff_tool.clear();
+                }
+                for tool in open_in::diff_tools() {
+                    if choice_row(ui, &c, &tool.name, &tool.location(), tools.diff_tool == tool.name) {
+                        tools.diff_tool.clone_from(&tool.name);
+                    }
+                }
+                if choice_row(ui, &c, "Another program", "A command line of your own", tools.diff_tool == Tools::CUSTOM) {
+                    tools.diff_tool = Tools::CUSTOM.to_string();
+                }
+                if tools.diff_tool == Tools::CUSTOM {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(44.0);
+                        let width = ui.available_width();
+                        w::text_field(ui, &mut tools.diff_command, "For example: meld", Some(ic::TERMINAL), width);
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(44.0);
+                        note(ui, "Spoon adds the old file and the new file at the end of this line.");
+                    });
+                }
+                ui.add_space(16.0);
+                note(ui, "To use it, right-click a file in a commit or in Changes, or press the compare button above a diff.");
+                ui.add_space(10.0);
+            });
+        });
+
+        if tools != self.prefs.tools {
+            self.prefs.tools = tools;
+            self.dirty = true;
+        }
+    }
+
+    /// Theme, source color, palette style and contrast on the left; on the right the
+    /// same choice shown on a small piece of Spoon, by day and by night. Changes apply
+    /// at once, so there is nothing to confirm.
+    fn appearance_page(&mut self, ui: &mut Ui, area: Rect) {
+        let c = self.colors;
+        let ctx = ui.ctx().clone();
+        let key = (self.prefs.theme, self.system_dark);
+        if self.previews.as_ref().is_none_or(|(prefs, dark, ..)| (*prefs, *dark) != key) {
+            let styles = PaletteStyle::ALL.map(|style| Colors::build(&ThemePrefs { style, ..key.0 }, key.1)).to_vec();
+            let modes = [Mode::Light, Mode::Dark].map(|mode| Colors::build(&ThemePrefs { mode, ..key.0 }, key.1));
+            self.previews = Some((key.0, key.1, styles, modes));
+        }
+        let Some((styles, modes)) = self.previews.as_ref().map(|(.., styles, modes)| (styles.clone(), *modes)) else { return };
         let mut prefs = self.prefs.theme;
 
-        let (close, dismissed) = w::dialog(ctx, "appearance-dialog", ic::PALETTE, "Appearance", 560.0, |ui| {
-            w::body_text(ui, "Colors are generated from one source color, like Material You on Android.");
+        let p = ui.painter().clone();
+        let head = page_head(ui, &c, area, ic::PALETTE, "Appearance", "Every color in Spoon is derived from one source color.");
+        let reset = Rect::from_min_max(pos2(head.right() - 180.0, head.top()), head.max);
+        w::hchild(ui, "appearance-reset", reset, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::btn("Reset appearance").kind(Kind::Text).enabled(prefs != ThemePrefs::default()).show(ui).clicked() {
+                    prefs = ThemePrefs::default();
+                }
+            });
+        });
+
+        let body = Rect::from_min_max(pos2(area.left(), head.bottom() + 16.0), area.max);
+        let controls = Rect::from_min_size(body.min, vec2(600.0, body.height()));
+        w::card(ui, controls, c.surface, 28.0);
+        w::child(ui, "appearance-controls", controls.shrink2(vec2(22.0, 8.0)), |ui| {
+            let hint = |ui: &mut Ui, text: &str| {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(text).font(theme::body(12.5)).color(c.on_surface_variant));
+            };
             w::field_label(ui, "Theme");
             let modes = [(Mode::System, Some(ic::AUTO), "System"), (Mode::Light, Some(ic::LIGHT), "Light"), (Mode::Dark, Some(ic::DARK), "Dark")];
             w::segmented(ui, "mode", &mut prefs.mode, &modes, 40.0);
+            hint(ui, "System follows the light or dark setting of your computer.");
 
             w::field_label(ui, "Source color");
             ui.horizontal(|ui| {
@@ -418,19 +552,26 @@ impl App {
                         prefs.seed = seed;
                     }
                 }
-                ui.add_space(6.0);
-                ui.color_edit_button_srgb(&mut prefs.seed).on_hover_text("Custom color");
+                // Any other color: the same size and roundness as the presets.
+                ui.spacing_mut().interact_size = vec2(44.0, 44.0);
+                let widgets = &mut ui.visuals_mut().widgets;
+                for state in [&mut widgets.inactive, &mut widgets.hovered, &mut widgets.active, &mut widgets.open] {
+                    state.corner_radius = CornerRadius::same(22);
+                }
+                ui.color_edit_button_srgb(&mut prefs.seed).on_hover_text("Any other color");
             });
+            hint(ui, "Pick one of these, or any other color with the last swatch.");
 
             w::field_label(ui, "Palette style");
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                for (style, colors) in PaletteStyle::ALL.into_iter().zip(&previews) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (style, colors) in PaletteStyle::ALL.into_iter().zip(&styles) {
                     if style_preview(ui, &c, colors, style.label(), prefs.style == style) {
                         prefs.style = style;
                     }
                 }
             });
+            hint(ui, "How far the other colors move away from the source color.");
 
             w::field_label(ui, "Contrast");
             let mut level = (prefs.contrast * 2.0).round() as i32;
@@ -438,25 +579,138 @@ impl App {
             if w::segmented(ui, "contrast", &mut level, &levels, 40.0) {
                 prefs.contrast = level as f32 / 2.0;
             }
-
-            ui.add_space(24.0);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let done = w::btn("Done").show(ui).clicked();
-                if w::btn("Reset").kind(Kind::Text).show(ui).clicked() {
-                    prefs = ThemePrefs::default();
-                }
-                done
-            })
-            .inner
+            hint(ui, "Higher contrast makes text and outlines stand out more.");
         });
+
+        // One card, day above night, so a color is judged in both before it is kept.
+        let preview = Rect::from_min_max(pos2(controls.right() + 16.0, body.top()), body.max);
+        let in_dark = match prefs.mode {
+            Mode::System => self.system_dark,
+            mode => mode == Mode::Dark,
+        };
+        let (day, night) = preview.split_top_bottom_at_fraction(0.5);
+        paint_preview(&p, day, &modes[0], "Light", !in_dark, CornerRadius { nw: 28, ne: 28, sw: 0, se: 0 });
+        paint_preview(&p, night, &modes[1], "Dark", in_dark, CornerRadius { nw: 0, ne: 0, sw: 28, se: 28 });
+        // The half in use has the window's own background: the outline keeps the card whole.
+        p.rect_stroke(preview, w::radius(28.0), Stroke::new(1.0, c.outline_variant), StrokeKind::Inside);
+
         if prefs != self.prefs.theme {
             self.prefs.theme = prefs;
-            self.retheme(ctx);
+            self.retheme(&ctx);
             self.save_prefs();
         }
-        if close || dismissed {
-            self.settings = false;
+    }
+}
+
+/// The top of a settings page: what the page is, and the one sentence that explains
+/// everything on it. Returns the rectangle it takes.
+fn page_head(ui: &Ui, c: &Colors, area: Rect, icon: &str, title: &str, about: &str) -> Rect {
+    let p = ui.painter();
+    let head = Rect::from_min_size(area.min, vec2(area.width(), 64.0));
+    let mark = pos2(head.left() + 28.0, head.center().y);
+    w::cookie(p, mark, 27.0, 8.0, 0.08, 0.0, c.primary_container);
+    w::icon_at(p, mark, icon, 24.0, c.on_primary_container);
+    p.text(pos2(head.left() + 70.0, head.top() + 20.0), Align2::LEFT_CENTER, title, theme::emph(24.0), c.on_surface);
+    p.text(pos2(head.left() + 70.0, head.top() + 46.0), Align2::LEFT_CENTER, about, theme::body(13.5), c.on_surface_variant);
+    head
+}
+
+/// One section in the settings window's list.
+fn section_item(ui: &mut Ui, c: &Colors, icon: &str, label: &str, selected: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 48.0), Sense::click());
+    let t = ui.ctx().animate_bool_with_time(resp.id.with("selected"), selected, 0.2);
+    let p = ui.painter();
+    let hover = Colors::state(c.surface_container, c.on_surface, if resp.hovered() { 0.08 } else { 0.0 });
+    p.rect_filled(rect, w::radius(24.0), hover.lerp_to_gamma(c.secondary_container, t));
+    let fg = c.on_surface_variant.lerp_to_gamma(c.on_secondary_container, t);
+    w::icon_at(p, pos2(rect.left() + 26.0, rect.center().y), icon, 20.0, fg);
+    let font = if selected { theme::emph(14.0) } else { theme::body(14.0) };
+    p.text(pos2(rect.left() + 50.0, rect.center().y), Align2::LEFT_CENTER, label, font, fg);
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+/// One of several exclusive choices: a radio mark, its name, and a quieter detail.
+fn choice_row(ui: &mut Ui, c: &Colors, label: &str, detail: &str, selected: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
+    let p = ui.painter();
+    let fill = Colors::state(c.surface, c.on_surface, if resp.hovered() { 0.08 } else { 0.0 });
+    p.rect_filled(rect, w::radius(22.0), if selected { c.surface_high } else { fill });
+    let (mark, tint) = if selected { (ic::RADIO_ON, c.primary) } else { (ic::RADIO_OFF, c.on_surface_variant) };
+    w::icon_at(p, pos2(rect.left() + 22.0, rect.center().y), mark, 20.0, tint);
+    let font = if selected { theme::emph(14.0) } else { theme::body(14.0) };
+    let end = rect.left() + 44.0 + w::label_in(p, Rect::from_min_max(pos2(rect.left() + 44.0, rect.top()), rect.max - vec2(12.0, 0.0)), label, font, c.on_surface);
+    w::label_in(p, Rect::from_min_max(pos2(end + 12.0, rect.top()), rect.max - vec2(14.0, 0.0)), detail, theme::body(12.5), c.on_surface_variant);
+    resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+}
+
+fn settings_window_id() -> ViewportId {
+    ViewportId::from_hash_of("settings")
+}
+
+/// A small piece of Spoon in the given colors: a toolbar button, a few commits with
+/// their graph and ref chips, and a diff. `in_use` marks the mode showing right now.
+fn paint_preview(p: &Painter, rect: Rect, c: &Colors, label: &str, in_use: bool, corner: CornerRadius) {
+    const ROW: f32 = 24.0;
+    let p = p.with_clip_rect(rect);
+    p.rect_filled(rect, corner, c.surface_container);
+    let inner = rect.shrink2(vec2(16.0, 14.0));
+
+    let mid = inner.top() + 14.0;
+    let end = p.text(pos2(inner.left() + 4.0, mid), Align2::LEFT_CENTER, label, theme::emph(13.5), c.on_surface).right();
+    if in_use {
+        w::chip(&p, pos2(end + 10.0, mid), ic::CHECK, "In use", c.primary_container, c.on_primary_container);
+    }
+    let push = Rect::from_min_max(pos2(inner.right() - 74.0, mid - 13.0), pos2(inner.right(), mid + 13.0));
+    p.rect_filled(push, w::radius(13.0), c.primary);
+    p.text(push.center(), Align2::CENTER_CENTER, "Push 2", theme::emph(11.5), c.on_primary);
+    p.text(pos2(push.left() - 14.0, mid), Align2::RIGHT_CENTER, "Pull", theme::emph(11.5), c.primary);
+
+    // History: lane, ref chip, subject. The third commit is the picked one.
+    let commits: [(usize, Option<(&str, &str, Color32, Color32)>, &str); 4] = [
+        (0, Some((ic::CHECK, "main", c.primary, c.on_primary)), "feat: season the soup"),
+        (1, Some((ic::BRANCH, "fix/lid-rattle", c.secondary_container, c.on_secondary_container)), "fix: lid rattles on a full pot"),
+        (0, None, "docs: tomato soup recipe"),
+        (0, Some((ic::TAG, "v1.0", c.tertiary_container, c.on_tertiary_container)), "feat: add pot model"),
+    ];
+    let list = Rect::from_min_size(pos2(inner.left(), inner.top() + 36.0), vec2(inner.width(), commits.len() as f32 * ROW + 12.0));
+    p.rect_filled(list, w::radius(16.0), c.surface);
+    let dot = |lane: usize, row: usize| pos2(list.left() + 18.0 + lane as f32 * 14.0, list.top() + 6.0 + (row as f32 + 0.5) * ROW);
+    let picked = Rect::from_min_size(pos2(list.left() + 4.0, list.top() + 6.0 + 2.0 * ROW), vec2(list.width() - 8.0, ROW));
+    p.rect_filled(picked, w::radius(ROW / 2.0), c.secondary_container);
+    p.line_segment([dot(0, 0), dot(0, 3)], Stroke::new(2.0, c.lanes[0]));
+    p.line_segment([dot(1, 1), dot(1, 2)], Stroke::new(2.0, c.lanes[1]));
+    p.line_segment([dot(1, 2), dot(0, 3)], Stroke::new(2.0, c.lanes[1]));
+    for (row, (lane, chip, subject)) in commits.into_iter().enumerate() {
+        let at = dot(lane, row);
+        p.circle_filled(at, 5.5, if row == 2 { c.secondary_container } else { c.surface });
+        p.circle_filled(at, 4.0, c.lanes[lane]);
+        let mut x = list.left() + 46.0;
+        if let Some((icon, name, fill, fg)) = chip {
+            x += w::chip(&p, pos2(x, at.y), icon, name, fill, fg) + 6.0;
         }
+        let (font, fg) = match row {
+            0 => (theme::emph(12.0), c.on_surface),
+            2 => (theme::body(12.0), c.on_secondary_container),
+            _ => (theme::body(12.0), c.on_surface),
+        };
+        w::label_in(&p, Rect::from_min_max(pos2(x, at.y - ROW / 2.0), pos2(list.right() - 10.0, at.y + ROW / 2.0)), subject, font, fg);
+    }
+
+    // Diff: one line of context, one taken out, one put in.
+    let diff = Rect::from_min_max(pos2(inner.left(), list.bottom() + 8.0), inner.max);
+    p.rect_filled(diff, w::radius(16.0), c.surface);
+    let p = p.with_clip_rect(diff.shrink2(vec2(0.0, 6.0)));
+    let lines = [(' ', "pub fn new(name: &str, servings: u32) -> Self {"), ('-', "    Self { name, servings: 4 }"), ('+', "    Self { name, servings, seasoned: false }")];
+    for (index, (sign, text)) in lines.into_iter().enumerate() {
+        let line = Rect::from_min_size(pos2(diff.left(), diff.top() + 7.0 + index as f32 * 18.0), vec2(diff.width(), 18.0));
+        let (fill, mark) = match sign {
+            '-' => (c.diff_deleted, c.deleted),
+            '+' => (c.diff_added, c.added),
+            _ => (Color32::TRANSPARENT, c.on_surface_variant),
+        };
+        p.rect_filled(line, 0.0, fill);
+        p.text(pos2(line.left() + 14.0, line.center().y), Align2::LEFT_CENTER, sign, theme::mono(11.0), mark);
+        p.text(pos2(line.left() + 28.0, line.center().y), Align2::LEFT_CENTER, text, theme::mono(11.0), c.on_surface);
     }
 }
 
@@ -483,7 +737,9 @@ impl eframe::App for App {
         match self.active.filter(|i| *i < self.repos.len()) {
             Some(index) => {
                 // One layout for every tab: hand it to the tab shown, take back what it changed.
+                let diff_tool = self.diff_tool();
                 let repo = &mut self.repos[index];
+                repo.diff_tool = diff_tool;
                 repo.layout = self.prefs.layout;
                 repo.ui(ui, body);
                 self.dirty |= repo.layout != self.prefs.layout;
@@ -495,9 +751,7 @@ impl eframe::App for App {
             repo.merge_window(&ctx);
         }
         self.clone_dialog(&ctx);
-        if self.settings {
-            self.settings_dialog(&ctx);
-        }
+        self.settings_window(&ctx);
         if let Some((text, error)) = self.notice.clone() {
             let (_, dismissed) = w::snackbar(&ctx, "app-snackbar", &text, error, "");
             if dismissed {
@@ -560,7 +814,7 @@ fn style_preview(ui: &mut Ui, c: &Colors, colors: &Colors, label: &str, selected
     let left = Rect::from_min_max(center - vec2(r, 0.0), center + vec2(0.0, r));
     p.with_clip_rect(left).circle_filled(center, r, colors.secondary_container);
     p.with_clip_rect(left.translate(vec2(r, 0.0))).circle_filled(center, r, colors.tertiary);
-    let font = if selected { theme::emph(11.5) } else { theme::body(11.5) };
+    let font = if selected { theme::emph(11.0) } else { theme::body(11.0) };
     let fg = c.on_surface_variant.lerp_to_gamma(c.on_secondary_container, t);
     p.text(pos2(rect.center().x, rect.bottom() - 15.0), Align2::CENTER_CENTER, label, font, fg);
     resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
