@@ -27,7 +27,7 @@ Spoon drives the `git` command line, so Git must be installed.
 ## What it does
 
 - Commit graph with branches, tags and remote refs; search by message, author, file or content
-- Local changes: stage, unstage, discard, commit, amend, sign off, commit and push
+- Local changes as a folder tree: stage, unstage, discard, commit, amend, sign off, commit and push
 - Branches: create, check out, rename, delete, track remote branches; shown as a
   foldable tree grouped by their `/` prefixes (`feat/…`, `fix/…`), with the current
   branch on top and folders closed until opened

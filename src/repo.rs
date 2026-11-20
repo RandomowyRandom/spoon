@@ -41,19 +41,18 @@ enum Group {
     Worktree,
 }
 
-/// What the detail cards show: a commit or a stash.
-/// One row of the file tree in the details card.
+/// One row of a file tree: in the details card and in the lists of changes.
 enum FileRow {
     Folder { key: String, name: String, depth: usize, open: bool },
-    /// Index into the detail's files.
+    /// Index into the files the tree was built from.
     File { index: usize, depth: usize },
 }
 
 /// Lays changed files out by folder, the way the sidebar lays out branches. Every
-/// folder is open unless it is in `folded`.
-fn file_rows(files: &[Change], folded: &BTreeSet<String>) -> Vec<FileRow> {
-    let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-    let rows = tree_rows(&paths, "files", &|key| !folded.contains(key));
+/// folder is open unless it is in `folded`, where its key starts with `scope`.
+fn file_rows<'a>(files: impl IntoIterator<Item = &'a Change>, scope: &str, folded: &BTreeSet<String>) -> Vec<FileRow> {
+    let paths: Vec<&str> = files.into_iter().map(|f| f.path.as_str()).collect();
+    let rows = tree_rows(&paths, scope, &|key| !folded.contains(key));
     rows.into_iter()
         .map(|row| match row {
             TreeRow::Folder { key, name, depth, open } => FileRow::Folder { key, name: name.to_string(), depth, open },
@@ -148,6 +147,8 @@ pub struct RepoView {
     folded: BTreeSet<String>,
     /// The file tree's rows, rebuilt when the details or `folded` change.
     file_rows: Option<Vec<FileRow>>,
+    /// Folders folded in the lists of changes: `unstaged/src/kitchen`, `staged/docs`.
+    change_folds: BTreeSet<String>,
     picked: Option<(String, bool)>,
     message: String,
     amend: bool,
@@ -212,6 +213,7 @@ impl RepoView {
             detail_file: None,
             folded: BTreeSet::new(),
             file_rows: None,
+            change_folds: BTreeSet::new(),
             picked: None,
             message: String::new(),
             amend: false,
@@ -297,7 +299,7 @@ impl RepoView {
                 Msg::Done(title, result) => self.on_done(ctx, title, result),
                 Msg::Detail(detail) if self.wanted.as_deref() == Some(&detail.sha) => {
                     // Open on the file at the top of the tree, which lists folders first.
-                    let rows = file_rows(&detail.files, &self.folded);
+                    let rows = file_rows(&detail.files, "files", &self.folded);
                     let first = rows.iter().find_map(|row| if let FileRow::File { index, .. } = row { Some(*index) } else { None });
                     let first = first.map(|index| (index, detail.files[index].clone()));
                     self.detail = Some(Arc::new(detail));
@@ -1475,7 +1477,7 @@ impl RepoView {
         y += 24.0;
 
         let list = Rect::from_min_max(pos2(inner.left(), y), inner.max);
-        let rows = self.file_rows.take().unwrap_or_else(|| file_rows(&detail.files, &self.folded));
+        let rows = self.file_rows.take().unwrap_or_else(|| file_rows(&detail.files, "files", &self.folded));
         let mut refold = false;
         w::rows(ui, "detail-files", list, ROW, rows.len(), None, |ui, range| {
             for row in &rows[range] {
@@ -1494,7 +1496,7 @@ impl RepoView {
                 let (row, resp) = w::row(ui, ROW);
                 let selected = self.detail_file == Some(i);
                 w::row_bg(ui, row, &resp, selected);
-                paint_tree_file(ui.painter(), &c, row, change, depth, selected);
+                paint_tree_file(ui.painter(), &c, row, change, change.index, depth, selected);
                 let resp = resp.on_hover_text(&change.path);
                 if resp.clicked() {
                     self.pick_file(&ctx, i, change.clone());
@@ -1769,16 +1771,29 @@ impl RepoView {
         if clicked {
             self.run(&ctx, vec![if staged { Op::UnstageAll } else { Op::StageAll }]);
         }
-        let toggle = |change: &Change| -> Op {
+        let flip = |change: &Change| -> Op {
             let mut paths = vec![change.path.clone()];
             paths.extend(change.orig.clone());
             if staged { Op::Unstage { paths } } else { Op::Stage { paths } }
         };
         let list = Rect::from_min_max(pos2(rect.left(), header.bottom()), rect.max);
-        w::rows(ui, if staged { "staged-rows" } else { "unstaged-rows" }, list, ROW, changes.len(), None, |ui, range| {
-            for i in range {
+        // ponytail: tree rebuilt every frame, cache it like `file_rows` if huge change sets get slow.
+        let rows = file_rows(changes.iter().copied(), if staged { "staged" } else { "unstaged" }, &self.change_folds);
+        w::rows(ui, if staged { "staged-rows" } else { "unstaged-rows" }, list, ROW, rows.len(), None, |ui, range| {
+            for row in &rows[range] {
+                let (i, depth) = match row {
+                    FileRow::Folder { key, name, depth, open } => {
+                        let icon = if *open { ic::FOLDER_OPEN } else { ic::FOLDER };
+                        if fold_row(ui, &c, *depth, icon, c.on_surface_variant, name, false, *open, Trail::Text("")).clicked() {
+                            toggle(&mut self.change_folds, key);
+                        }
+                        continue;
+                    }
+                    FileRow::File { index, depth } => (*index, *depth),
+                };
                 let change = changes[i];
                 let (row, resp) = w::row(ui, ROW);
+                let resp = resp.on_hover_text(&change.path);
                 let selected = self.picked.as_ref().is_some_and(|(path, s)| *s == staged && path == &change.path);
                 w::row_bg(ui, row, &resp, selected);
                 let status = match (staged, change.conflicted(), change.untracked()) {
@@ -1788,11 +1803,12 @@ impl RepoView {
                     _ => change.work,
                 };
                 let hot = ui.rect_contains_pointer(row);
-                paint_change_row(ui.painter(), &c, row, change, status, selected, if hot { 34.0 } else { 0.0 });
+                // The stage button takes the right end of the row under the pointer.
+                paint_tree_file(ui.painter(), &c, if hot { row.with_max_x(row.right() - 34.0) } else { row }, change, status, depth, selected);
                 if resp.double_clicked() && change.conflicted() {
                     self.open_conflict(&ctx, change);
                 } else if resp.double_clicked() {
-                    self.run(&ctx, vec![toggle(change)]);
+                    self.run(&ctx, vec![flip(change)]);
                 } else if resp.clicked() {
                     self.pick_change(&ctx, change, staged);
                 }
@@ -1800,12 +1816,12 @@ impl RepoView {
                     let button = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
                     let (icon, tip) = if staged { (ic::REMOVE, "Unstage") } else { (ic::ADD, "Stage") };
                     if w::icon_btn(icon, tip).size(26.0).kind(Kind::Tonal).show_at(ui, resp.id.with("toggle"), button).clicked() {
-                        self.run(&ctx, vec![toggle(change)]);
+                        self.run(&ctx, vec![flip(change)]);
                     }
                 }
                 resp.context_menu(|ui| {
                     if w::menu_item(ui, if staged { ic::REMOVE } else { ic::ADD }, if staged { "Unstage" } else { "Stage" }) {
-                        self.run(&ctx, vec![toggle(change)]);
+                        self.run(&ctx, vec![flip(change)]);
                     }
                     if change.conflicted() {
                         if w::menu_item(ui, ic::EDIT, "Resolve in editor\u{2026}") {
@@ -2084,21 +2100,6 @@ fn side_card(ui: &Ui, c: &Colors, rect: Rect, side: Option<&ConflictSide>, name:
     }
 }
 
-/// Status badge, file name, then its directory in a quieter tone.
-fn paint_change_row(p: &Painter, c: &Colors, row: Rect, change: &Change, status: char, selected: bool, reserve_right: f32) {
-    w::status_badge(p, pos2(row.left() + 18.0, row.center().y), status, c);
-    let (dir, name) = split_path(&change.path);
-    let fg = if selected { c.on_secondary_container } else { c.on_surface };
-    let right = row.right() - 8.0 - reserve_right;
-    let mut x = row.left() + 36.0;
-    x += w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(right, row.bottom())), name, theme::emph(13.0), fg) + 8.0;
-    let dir = match &change.orig {
-        Some(orig) => format!("{dir}  \u{2190} {orig}"),
-        None => dir.to_string(),
-    };
-    w::label_in(p, Rect::from_min_max(pos2(x, row.top()), pos2(right, row.bottom())), &dir, theme::body(12.0), c.on_surface_variant);
-}
-
 /// How long ago, in few characters: `now`, `26 min`, `3 h`, `5 d`, `7 wk`. Past a
 /// year it is the day itself, taken from `date` (`2024-03-02 12:00`).
 pub(crate) fn ago(time: i64, now: i64, date: &str) -> String {
@@ -2142,15 +2143,11 @@ pub(crate) fn ref_chips(refs: &[git::Ref]) -> Vec<(&git::Ref, bool)> {
     chips
 }
 
-/// Paints one history row. The subject is the loud part; everything else is quiet.
-/// Returns a tooltip for what the pointer is over: the full date, or all refs when
-/// some are shortened or folded into `+2`.
-#[allow(clippy::too_many_arguments)]
 /// A file in the tree: status badge and name, lined up with the folder rows. The
 /// folders above say where it is, so only a rename's old path is added.
-fn paint_tree_file(p: &Painter, c: &Colors, row: Rect, change: &Change, depth: usize, selected: bool) {
+fn paint_tree_file(p: &Painter, c: &Colors, row: Rect, change: &Change, status: char, depth: usize, selected: bool) {
     let left = row.left() + 26.0 + depth as f32 * 18.0;
-    w::status_badge(p, pos2(left, row.center().y), change.index, c);
+    w::status_badge(p, pos2(left, row.center().y), status, c);
     let (_, name) = split_path(&change.path);
     let fg = if selected { c.on_secondary_container } else { c.on_surface };
     let right = row.right() - 8.0;
@@ -2161,6 +2158,10 @@ fn paint_tree_file(p: &Painter, c: &Colors, row: Rect, change: &Change, depth: u
     }
 }
 
+/// Paints one history row. The subject is the loud part; everything else is quiet.
+/// Returns a tooltip for what the pointer is over: the full date, or all refs when
+/// some are shortened or folded into `+2`.
+#[allow(clippy::too_many_arguments)]
 fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool, now: i64, one_remote: bool, pointer: Option<Pos2>) -> Option<String> {
     const MAX_CHIPS: usize = 2;
     let fg = if selected { c.on_secondary_container } else { c.on_surface };
