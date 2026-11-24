@@ -43,7 +43,26 @@ fn command(dir: &Path) -> Command {
 }
 
 pub fn run<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Output {
-    match command(dir).args(args).output() {
+    finished(dir, command(dir).args(args).output())
+}
+
+/// Like `run`, with `input` as the command's standard input.
+fn run_with_input(dir: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let child = command(dir).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
+    finished(
+        dir,
+        child.and_then(|mut child| {
+            // Taken, so the pipe closes after the write and git sees the end of its input.
+            let written = child.stdin.take().map_or(Ok(()), |mut stdin| stdin.write_all(input.as_bytes()));
+            let output = child.wait_with_output();
+            written.and(output)
+        }),
+    )
+}
+
+fn finished(dir: &Path, result: std::io::Result<std::process::Output>) -> Output {
+    match result {
         Ok(o) => Output {
             ok: o.status.success(),
             stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -645,6 +664,16 @@ pub fn difftool(repo: &Path, command: &str, spec: &DiffSpec) -> OpResult {
     // for "the files differ". A command the shell could not start shows in its words.
     let missing = ["not found", "No such file", "cannot execute", "Permission denied"].iter().any(|sign| out.stderr.contains(sign));
     OpResult { ok: out.ok && !missing, log: format!("$ git {}\n{}{}", args.join(" "), out.stdout, out.stderr), error: out.stderr }
+}
+
+/// Applies `patch` (see `Diff::patch`) to the index alone; the files stay as they
+/// are. `reverse` takes the patch's changes out of the index instead.
+pub fn apply_to_index(repo: &Path, patch: &str, reverse: bool) -> OpResult {
+    let mut args = vec!["apply", "--cached", "--whitespace=nowarn"];
+    args.extend(reverse.then_some("--reverse"));
+    args.push("-");
+    let out = run_with_input(repo, &args, patch);
+    OpResult { ok: out.ok, log: format!("$ git {} ({} lines)\n{}{}\n", args.join(" "), patch.lines().count(), out.stdout, out.stderr), error: out.stderr }
 }
 
 pub fn diff_text(repo: &Path, spec: &DiffSpec) -> String {

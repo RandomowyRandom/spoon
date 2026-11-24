@@ -1,7 +1,7 @@
 //! User preferences, stored as JSON in the platform config directory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,14 @@ pub struct Prefs {
     pub zoom: f32,
     /// Branch folders left open in the sidebar, by repository path.
     pub open_folders: BTreeMap<String, BTreeSet<String>>,
+    /// Colors given to branch folders, by repository path: the folder (`feat`,
+    /// `feat/menu`) and its hue.
+    pub folder_colors: BTreeMap<String, BTreeMap<String, f32>>,
+    /// One set of folder colors for every repository, in place of each one's own.
+    pub share_folder_colors: bool,
+    /// That one set. Each repository's own colors are kept beside it, for when
+    /// sharing is turned off again.
+    pub shared_folder_colors: BTreeMap<String, f32>,
     pub layout: Layout,
     pub tools: Tools,
 }
@@ -61,7 +69,45 @@ impl Default for Layout {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new(), layout: Layout::default(), tools: Tools::default() }
+        Self { theme: ThemePrefs::default(), repos: Vec::new(), open: Vec::new(), history_limit: 5000, zoom: 0.9, open_folders: BTreeMap::new(), folder_colors: BTreeMap::new(), share_folder_colors: false, shared_folder_colors: BTreeMap::new(), layout: Layout::default(), tools: Tools::default() }
+    }
+}
+
+impl Prefs {
+    /// The folder colors a repository shows: the shared set, or its own.
+    pub fn colors_of(&self, repo: &Path) -> &BTreeMap<String, f32> {
+        static NONE: BTreeMap<String, f32> = BTreeMap::new();
+        match self.share_folder_colors {
+            true => &self.shared_folder_colors,
+            false => self.folder_colors.get(&repo.display().to_string()).unwrap_or(&NONE),
+        }
+    }
+
+    /// Stores the colors a repository shows now, in the shared set when colors are
+    /// shared. Says whether that changed anything.
+    pub fn set_colors(&mut self, repo: &Path, colors: &BTreeMap<String, f32>) -> bool {
+        if self.colors_of(repo) == colors {
+            return false;
+        }
+        let key = repo.display().to_string();
+        match (self.share_folder_colors, colors.is_empty()) {
+            (true, _) => self.shared_folder_colors.clone_from(colors),
+            (false, true) => drop(self.folder_colors.remove(&key)),
+            (false, false) => drop(self.folder_colors.insert(key, colors.clone())),
+        }
+        true
+    }
+
+    /// Turns sharing of folder colors on or off. A shared set that is still empty
+    /// starts as every repository's colors together; where two repositories color
+    /// a folder differently, `lead` (the repository in front) has its way.
+    pub fn share_colors(&mut self, on: bool, lead: Option<&Path>) {
+        self.share_folder_colors = on;
+        if on && self.shared_folder_colors.is_empty() {
+            let own = |colors: &BTreeMap<String, f32>| colors.iter().map(|(folder, hue)| (folder.clone(), *hue)).collect::<Vec<_>>();
+            let lead = lead.and_then(|repo| self.folder_colors.get(&repo.display().to_string()));
+            self.shared_folder_colors = self.folder_colors.values().chain(lead).flat_map(own).collect();
+        }
     }
 }
 

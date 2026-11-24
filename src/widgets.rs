@@ -620,6 +620,38 @@ fn menu_row(ui: &mut Ui, icon: &str, label: &str, fg: Color32) -> bool {
     clicked
 }
 
+/// The folder hues as a grid of swatches; `current` wears a ring and a check. A swatch
+/// swells under the pointer. Returns the hue clicked, and the hue under the pointer.
+pub fn hue_swatches(ui: &mut Ui, current: Option<f32>) -> (Option<f32>, Option<f32>) {
+    // As wide as a menu's rows, so a menu keeps its width with them or without.
+    const COLUMNS: usize = 6;
+    const CELL: Vec2 = vec2(MENU_WIDTH / COLUMNS as f32, 40.0);
+    let c = colors(ui);
+    let rows = theme::FOLDER_HUES.len().div_ceil(COLUMNS);
+    let (grid, _) = ui.allocate_exact_size(vec2(MENU_WIDTH, CELL.y * rows as f32), Sense::hover());
+    let (mut clicked, mut hovered) = (None, None);
+    for (n, (name, hue)) in theme::FOLDER_HUES.iter().enumerate() {
+        let cell = Rect::from_min_size(grid.min + vec2((n % COLUMNS) as f32 * CELL.x, (n / COLUMNS) as f32 * CELL.y), CELL);
+        let resp = ui.interact(cell, ui.scope_id().with(("hue", n)), Sense::click());
+        let (hover, press) = interaction(ui, &resp);
+        let chosen = ui.ctx().animate_bool_with_time(resp.id.with("chosen"), current == Some(*hue), 0.15);
+        let (accent, _, _) = c.tint(*hue);
+        let p = ui.painter();
+        p.circle_filled(cell.center(), 12.0 + 2.5 * hover * (1.0 - chosen) - 1.5 * chosen - press, accent);
+        if chosen > 0.0 {
+            p.circle_stroke(cell.center(), 15.5, Stroke::new(2.0 * chosen, accent));
+            icon_at(p, cell.center(), ic::CHECK, 14.0, c.surface.gamma_multiply(chosen));
+        }
+        if resp.hovered() {
+            hovered = Some(*hue);
+        }
+        if resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(*name).clicked() {
+            clicked = Some(*hue);
+        }
+    }
+    (clicked, hovered)
+}
+
 pub fn menu_item(ui: &mut Ui, icon: &str, label: &str) -> bool {
     let c = colors(ui);
     menu_row(ui, icon, label, c.on_surface)

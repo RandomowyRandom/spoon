@@ -27,10 +27,13 @@ Spoon drives the `git` command line, so Git must be installed.
 ## What it does
 
 - Commit graph with branches, tags and remote refs; search by message, author, file or content
-- Local changes as a folder tree: stage, unstage, discard, commit, amend, sign off, commit and push
+- Local changes as a folder tree: stage and unstage by file, folder, hunk or picked lines; discard,
+  commit, amend, sign off, commit and push
 - Branches: create, check out, rename, delete, track remote branches; shown as a
   foldable tree grouped by their `/` prefixes (`feat/…`, `fix/…`), with the current
-  branch on top and folders closed until opened
+  branch on top and folders closed until opened; a folder can be given a color, which its
+  branches then wear in the sidebar and on the history's labels (per repository, or one set
+  for all of them: Settings, Appearance)
 - Merge (default, no fast-forward, fast-forward only, squash), rebase, cherry-pick, revert, reset
 - Conflict editor in its own window: pick single lines from either side, edit the result,
   then continue, skip or abort; whole-file "use ours" and "use theirs" as well

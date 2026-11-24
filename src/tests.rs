@@ -1367,6 +1367,17 @@ fn branches_group_into_folders_by_prefix() {
     let keys: Vec<String> = tree_rows(&names, "remote/origin", &|_| true).into_iter().filter_map(|row| if let TreeRow::Folder { key, .. } = row { Some(key) } else { None }).collect();
     assert_eq!(keys, ["remote/origin/backup", "remote/origin/feat", "remote/origin/feat/anims", "remote/origin/feat/twin"]);
 
+    // A branch wears the color of its nearest colored folder; one outside any folder has none.
+    let colors: std::collections::BTreeMap<String, f32> = [("feat".to_string(), 25.0), ("feat/anims".to_string(), 250.0)].into();
+    let hue = |branch: &str| crate::repo::folder_hue(&colors, branch);
+    assert_eq!([hue("feat/twin/x"), hue("feat/workstation-setup"), hue("feat/anims/Value")], [Some(25.0), Some(25.0), Some(250.0)]);
+    assert_eq!([hue("feat"), hue("feature/x"), hue("main"), hue("")], [None; 4]);
+
+    // A folder's members sit under its whole name, at any depth; a name that only starts alike is not one.
+    let files = ["src/a.rs", "src/kitchen/b.rs", "srcx/c.rs", "todo.txt"];
+    assert_eq!(crate::repo::folder_members("unstaged/src", "unstaged", &files), [0, 1]);
+    assert_eq!(crate::repo::folder_members("unstaged/src/kitchen", "unstaged", &files), [1]);
+
     // Odd names never loop or vanish: every branch still appears exactly once.
     let odd = ["a//b", "/lead", "trail/", "//", "", "x/y/z/w"];
     let mut seen: Vec<usize> = tree_rows(&odd, "local", &|_| true).iter().filter_map(|row| if let TreeRow::Leaf { index, .. } = row { Some(*index) } else { None }).collect();
@@ -1991,4 +2002,114 @@ fn graph_layout_linear_and_merged_history() {
     let cut = git::commits(&repo, &LogQuery { limit: 4, all_branches: true, search: None });
     assert_graph_sane(&cut, &graph::layout(&cut));
     assert!(graph::layout(&[]).dots.is_empty());
+}
+
+#[test]
+fn single_lines_go_in_and_out_of_the_index() {
+    let sb = Sandbox::new();
+    let repo = sb.repo("r");
+    let index = |file: &str| git::run(&repo, &["show", &format!(":{file}")]).stdout;
+    let diff_of = |file: &str, staged: bool| {
+        let changes = git::status(&repo);
+        let change = change(&changes, file).clone();
+        diff::parse(&git::diff_text(&repo, &if staged { DiffSpec::Staged(change) } else { DiffSpec::Unstaged(change) }))
+    };
+    // Stages, or unstages, the changed lines that read as one of `texts`.
+    let flip = |file: &str, staged: bool, texts: &[&str]| {
+        let diff = diff_of(file, staged);
+        let patch = diff.patch(|i| texts.contains(&diff.lines[i].text.as_str()), staged).expect("something to apply");
+        let result = git::apply_to_index(&repo, &patch, staged);
+        assert!(result.ok, "{}\n{patch}", result.log);
+    };
+    let numbered = |lines: &[&str]| lines.iter().map(|l| format!("{l}\n")).collect::<String>();
+    let old: Vec<String> = (1..=30).map(|n| format!("l{n}")).collect();
+    let old: Vec<&str> = old.iter().map(String::as_str).collect();
+
+    // Two hunks: line 2 rewritten with two lines added after it, and line 28 rewritten.
+    commit(&repo, "a.txt", &numbered(&old), "root");
+    let work = numbered(&[&["l1", "L2", "extra-a", "extra-b"], &old[2..27], &["L28", "l29", "l30"]].concat());
+    write(&repo, "a.txt", &work);
+
+    // One added line of the first hunk and the whole change of the second. The second
+    // hunk lands one line lower in the index than in the file's old version.
+    flip("a.txt", false, &["extra-a", "l28", "L28"]);
+    assert_eq!(index("a.txt"), numbered(&[&["l1", "l2", "extra-a"], &old[2..27], &["L28", "l29", "l30"]].concat()));
+    assert_eq!(read(&repo, "a.txt"), work, "the file itself is never touched");
+    // The rest is still there to stage.
+    let left = diff_of("a.txt", false);
+    assert_eq!((left.added, left.deleted), (2, 1));
+
+    // Out again: the added line, and of the second change only its new line, so that
+    // the removal of l28 stays staged.
+    flip("a.txt", true, &["extra-a", "L28"]);
+    assert_eq!(index("a.txt"), numbered(&[&old[..27], &["l29", "l30"]].concat()));
+    assert_eq!(read(&repo, "a.txt"), work);
+
+    // A new file goes in line by line, and comes out the same way.
+    write(&repo, "new.txt", "a\nb\nc\n");
+    flip("new.txt", false, &["b"]);
+    assert_eq!(index("new.txt"), "b\n");
+    flip("new.txt", false, &["a"]);
+    assert_eq!(index("new.txt"), "a\nb\n");
+    flip("new.txt", true, &["b"]);
+    assert_eq!(index("new.txt"), "a\n");
+    flip("new.txt", true, &["a"]);
+    assert!(change(&git::status(&repo), "new.txt").untracked(), "its last line unstaged, the file is untracked again");
+    assert_eq!(read(&repo, "new.txt"), "a\nb\nc\n");
+
+    // Line ends and tabs reach git as they are in the file, though shown differently.
+    commit(&repo, "dos.txt", "keep\r\n\told\r\nend\r\n", "dos");
+    write(&repo, "dos.txt", "keep\r\n\tnew\r\nend\r\nmore\r\n");
+    flip("dos.txt", false, &["    old", "    new"]);
+    assert_eq!(index("dos.txt"), "keep\r\n\tnew\r\nend\r\n");
+
+    // Nothing picked, or only unchanged lines: no patch.
+    let diff = diff_of("dos.txt", false);
+    assert!(diff.patchable());
+    assert_eq!(diff.patch(|_| false, false), None);
+    assert_eq!(diff.patch(|i| diff.lines[i].text == "end", false), None);
+
+    // A deleted file and a binary one are staged whole or not at all.
+    fs::remove_file(repo.join("dos.txt")).unwrap();
+    write(&repo, "bin.dat", "\0\u{1}\0\u{2}");
+    for file in ["dos.txt", "bin.dat"] {
+        let diff = diff_of(file, false);
+        assert!(!diff.patchable(), "{file}");
+        assert_eq!(diff.patch(|_| true, false), None, "{file}");
+    }
+}
+
+#[test]
+fn folder_colors_are_each_repository_s_own_or_shared() {
+    use crate::prefs::Prefs;
+    use std::collections::BTreeMap;
+    let colors = |pairs: &[(&str, f32)]| pairs.iter().map(|(folder, hue)| (folder.to_string(), *hue)).collect::<BTreeMap<String, f32>>();
+    let (a, b, c) = (Path::new("/work/a"), Path::new("/work/b"), Path::new("/work/c"));
+    let mut prefs = Prefs::default();
+
+    // Its own: a change in one repository is not seen in another, and storing the same again is no change.
+    assert!(prefs.set_colors(a, &colors(&[("feat", 250.0), ("fix", 25.0)])));
+    assert!(prefs.set_colors(b, &colors(&[("feat", 145.0), ("docs", 75.0)])));
+    assert!(!prefs.set_colors(b, &colors(&[("feat", 145.0), ("docs", 75.0)])));
+    assert_eq!(prefs.colors_of(a), &colors(&[("feat", 250.0), ("fix", 25.0)]));
+    assert!(prefs.colors_of(c).is_empty());
+
+    // Shared: the set starts as all of them together, the repository in front settling a clash.
+    prefs.share_colors(true, Some(a));
+    let all = colors(&[("docs", 75.0), ("feat", 250.0), ("fix", 25.0)]);
+    assert_eq!([prefs.colors_of(a), prefs.colors_of(b), prefs.colors_of(c)], [&all; 3]);
+    // A change made in one repository is now seen in every one.
+    assert!(prefs.set_colors(c, &colors(&[("feat", 305.0)])));
+    assert_eq!([prefs.colors_of(a), prefs.colors_of(b)], [&colors(&[("feat", 305.0)]); 2]);
+
+    // Turned off, each repository has what it had; turned on again, the shared set is as it was left.
+    prefs.share_colors(false, None);
+    assert_eq!(prefs.colors_of(b), &colors(&[("feat", 145.0), ("docs", 75.0)]));
+    assert!(prefs.colors_of(c).is_empty());
+    prefs.share_colors(true, Some(b));
+    assert_eq!(prefs.colors_of(a), &colors(&[("feat", 305.0)]));
+
+    // Both settings survive being written and read.
+    let read: Prefs = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+    assert_eq!(read, prefs);
 }

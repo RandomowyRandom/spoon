@@ -128,7 +128,9 @@ impl App {
             Some(index) => index,
             None => {
                 let folders = self.prefs.open_folders.get(&root.display().to_string()).cloned().unwrap_or_default();
-                self.repos.push(RepoView::new(root.clone(), self.prefs.history_limit, folders, ctx));
+                let mut repo = RepoView::new(root.clone(), self.prefs.history_limit, folders, ctx);
+                repo.folder_colors.clone_from(self.prefs.colors_of(&root));
+                self.repos.push(repo);
                 self.repos.len() - 1
             }
         });
@@ -211,6 +213,12 @@ impl App {
                 changed = true;
             }
         }
+        // Folder colors: at most one tab changed its own in this frame. Those are stored
+        // first; then every tab shows what is stored, which is one set when colors are shared.
+        if let Some(repo) = self.repos.iter().find(|repo| self.prefs.colors_of(&repo.path) != &repo.folder_colors) {
+            changed |= self.prefs.set_colors(&repo.path, &repo.folder_colors);
+        }
+        self.show_stored_colors();
         // Written once the mouse is up, so dragging a splitter is one write, not hundreds.
         self.dirty |= changed;
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
@@ -421,7 +429,7 @@ impl App {
         }
         let builder = ViewportBuilder::default()
             .with_title("Settings - Spoon")
-            .with_inner_size([1300.0, 640.0])
+            .with_inner_size([1300.0, 790.0])
             .with_min_inner_size([1260.0, 640.0])
             .with_icon(crate::window_icon());
         let close = ctx.show_viewport_immediate(settings_window_id(), builder, |ui, _| {
@@ -508,6 +516,16 @@ impl App {
     /// Theme, source color, palette style and contrast on the left; on the right the
     /// same choice shown on a small piece of Spoon, by day and by night. Changes apply
     /// at once, so there is nothing to confirm.
+    /// Gives every tab the folder colors that are stored for it.
+    fn show_stored_colors(&mut self) {
+        for repo in &mut self.repos {
+            let stored = self.prefs.colors_of(&repo.path);
+            if &repo.folder_colors != stored {
+                repo.folder_colors.clone_from(stored);
+            }
+        }
+    }
+
     fn appearance_page(&mut self, ui: &mut Ui, area: Rect) {
         let c = self.colors;
         let ctx = ui.ctx().clone();
@@ -519,6 +537,7 @@ impl App {
         }
         let Some((styles, modes)) = self.previews.as_ref().map(|(.., styles, modes)| (styles.clone(), *modes)) else { return };
         let mut prefs = self.prefs.theme;
+        let mut share = self.prefs.share_folder_colors;
 
         let p = ui.painter().clone();
         let head = page_head(ui, &c, area, ic::PALETTE, "Appearance", "Every color in Spoon is derived from one source color.");
@@ -534,7 +553,9 @@ impl App {
         let body = Rect::from_min_max(pos2(area.left(), head.bottom() + 16.0), area.max);
         let controls = Rect::from_min_size(body.min, vec2(600.0, body.height()));
         w::card(ui, controls, c.surface, 28.0);
-        w::child(ui, "appearance-controls", controls.shrink2(vec2(22.0, 8.0)), |ui| {
+        // Scrolls when the window is lower than the controls are tall.
+        let scrolled = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| drop(ScrollArea::vertical().id_salt("appearance-controls").auto_shrink(false).show(ui, |ui| add(ui)));
+        w::child(ui, "appearance-controls", controls.shrink2(vec2(22.0, 8.0)), |ui| scrolled(ui, &mut |ui| {
             let hint = |ui: &mut Ui, text: &str| {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(text).font(theme::body(12.5)).color(c.on_surface_variant));
@@ -580,7 +601,12 @@ impl App {
                 prefs.contrast = level as f32 / 2.0;
             }
             hint(ui, "Higher contrast makes text and outlines stand out more.");
-        });
+
+            w::field_label(ui, "Folder colors");
+            w::switch(ui, &mut share, "Same in every repository");
+            hint(ui, "A branch folder such as feat then has one color in all of them. Turned off, each repository has its own colors again.");
+            ui.add_space(12.0);
+        }));
 
         // One card, day above night, so a color is judged in both before it is kept.
         let preview = Rect::from_min_max(pos2(controls.right() + 16.0, body.top()), body.max);
@@ -597,6 +623,13 @@ impl App {
         if prefs != self.prefs.theme {
             self.prefs.theme = prefs;
             self.retheme(&ctx);
+            self.save_prefs();
+        }
+        if share != self.prefs.share_folder_colors {
+            let lead = self.active.and_then(|index| self.repos.get(index)).map(|repo| repo.path.clone());
+            self.prefs.share_colors(share, lead.as_deref());
+            // At once, before a tab's old colors are taken for a change made in it.
+            self.show_stored_colors();
             self.save_prefs();
         }
     }

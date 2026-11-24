@@ -1,7 +1,7 @@
 //! One open repository: state, background work, and its three pages
 //! (history, local changes, stashes).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -59,6 +59,18 @@ fn file_rows<'a>(files: impl IntoIterator<Item = &'a Change>, scope: &str, folde
             TreeRow::Leaf { index, depth, .. } => FileRow::File { index, depth },
         })
         .collect()
+}
+
+/// The lines picked in the diff of a change, to stage or unstage on their own.
+#[derive(Default)]
+struct LinePick {
+    /// The picked lines, as indices into the diff's lines. Only changed lines are picked.
+    lines: BTreeSet<usize>,
+    /// The line clicked last, where a Shift-click range starts.
+    anchor: Option<usize>,
+    /// A drag in progress: the line it began on, whether it picks or lets go, and
+    /// what was picked before it.
+    drag: Option<(usize, bool, BTreeSet<usize>)>,
 }
 
 struct Detail {
@@ -133,6 +145,13 @@ pub struct RepoView {
     /// Branch folders left open, by key: `local/feat/anims`, `remote/origin`, `remote/origin/fix`.
     /// Folders start closed, so a repository with many branches opens calm.
     pub opened: BTreeSet<String>,
+    /// Colors given to branch folders: the folder (`feat`, `feat/menu`) and its hue.
+    /// The same folder under a remote wears the same color.
+    pub folder_colors: BTreeMap<String, f32>,
+    /// A color being tried on: the folder, and the hue of the swatch under the pointer.
+    color_preview: Option<(String, f32)>,
+    /// `folder_colors` as shown this frame, the color being tried on included.
+    tints: BTreeMap<String, f32>,
     /// Multi-selected sidebar rows of `mark_group`: branch or tag names, worktree paths.
     marked: BTreeSet<String>,
     mark_group: Group,
@@ -157,6 +176,7 @@ pub struct RepoView {
     diff_generation: u64,
     diff_spec: Option<DiffSpec>,
     diff: Option<Arc<Diff>>,
+    line_pick: LinePick,
     diff_title: String,
     /// Pane sizes and open sections; the app copies the shared layout in each frame.
     pub layout: crate::prefs::Layout,
@@ -203,6 +223,9 @@ impl RepoView {
             sides: None,
             take: (true, true),
             opened,
+            folder_colors: BTreeMap::new(),
+            color_preview: None,
+            tints: BTreeMap::new(),
             marked: BTreeSet::new(),
             mark_group: Group::Local,
             anchor: None,
@@ -222,6 +245,7 @@ impl RepoView {
             diff_generation: 0,
             diff_spec: None,
             diff: None,
+            line_pick: LinePick::default(),
             diff_title: String::new(),
             layout: crate::prefs::Layout::default(),
             diff_tool: None,
@@ -309,7 +333,13 @@ impl RepoView {
                         self.pick_file(ctx, index, change);
                     }
                 }
-                Msg::Diff(generation, diff) if generation == self.diff_generation => self.diff = Some(Arc::new(diff)),
+                Msg::Diff(generation, diff) if generation == self.diff_generation => {
+                    // Picked lines are places in the diff: they hold only while it reads the same.
+                    if self.diff.as_ref().is_none_or(|shown| shown.raw != diff.raw) {
+                        self.line_pick = LinePick::default();
+                    }
+                    self.diff = Some(Arc::new(diff));
+                }
                 Msg::LastMessage(message) if self.message.trim().is_empty() => self.message = message,
                 Msg::Text(title, text) => self.text_view = Some((title, text)),
                 Msg::Tool(name, result) => {
@@ -470,7 +500,8 @@ impl RepoView {
             Group::Tag => snap.tags.iter().any(|t| &t.name == key),
             Group::Worktree => snap.worktrees.iter().any(|t| &t.path == key),
         });
-        self.snap = Some(Arc::new(snap));        self.graph = Arc::new(graph);
+        self.snap = Some(Arc::new(snap));
+        self.graph = Arc::new(graph);
     }
 
     // ------------------------------------------------------------ selection
@@ -479,6 +510,7 @@ impl RepoView {
         self.diff_generation += 1;
         self.diff_spec = None;
         self.diff = None;
+        self.line_pick = LinePick::default();
         self.diff_title.clear();
     }
 
@@ -609,6 +641,16 @@ impl RepoView {
     }
 
     /// Opens the diff in the program picked in Settings, without holding up the window.
+    /// Stages the changes in `patch`, or with `reverse` unstages them; the files stay as they are.
+    fn stage_lines(&mut self, ctx: &Context, patch: String, reverse: bool) {
+        if let Some(running) = self.busy {
+            return self.notify(format!("{running} is still running"), true, ctx);
+        }
+        let title = if reverse { "Unstage lines" } else { "Stage lines" };
+        self.busy = Some(title);
+        self.spawn(ctx, move |repo| Msg::Done(title, git::apply_to_index(repo, &patch, reverse)));
+    }
+
     fn open_in_diff_tool(&mut self, ctx: &Context, spec: DiffSpec) {
         let Some((name, command)) = self.diff_tool.clone() else { return };
         self.spawn(ctx, move |repo| Msg::Tool(name, git::difftool(repo, &command, &spec)));
@@ -652,12 +694,17 @@ impl RepoView {
         if ui.input(|i| i.key_pressed(Key::F5)) {
             self.reload(&ctx);
         }
+        self.tints.clone_from(&self.folder_colors);
+        self.tints.extend(self.color_preview.take());
         // Esc backs out one step: first the sidebar selection, then the open details.
         let overlay = self.dialog.is_some() || self.show_log || self.text_view.is_some();
         if !overlay && ui.input(|i| i.key_pressed(Key::Escape)) {
-            match self.marked.is_empty() {
-                true if self.page != Page::Changes => self.deselect(),
-                _ => self.marked.clear(),
+            if self.page == Page::Changes && !self.line_pick.lines.is_empty() {
+                self.line_pick = LinePick::default();
+            } else if self.marked.is_empty() && self.page != Page::Changes {
+                self.deselect();
+            } else {
+                self.marked.clear();
             }
         }
         let Some(snap) = self.snap.clone() else {
@@ -1086,16 +1133,56 @@ impl RepoView {
     fn folder_row(&mut self, ui: &mut Ui, c: &Colors, key: &str, name: &str, depth: usize, open: bool, group: Group, members: Vec<String>) {
         let count = members.len().to_string();
         let icon = if open { ic::FOLDER_OPEN } else { ic::FOLDER };
-        let resp = fold_row(ui, c, depth, icon, c.on_surface_variant, name, false, open, Trail::Text(if open { "" } else { &count }));
+        // The folder as branches name it: without `local/`, or `remote/` and the remote's name.
+        let folder = match group {
+            Group::Remote => key.splitn(3, '/').nth(2),
+            _ => key.split_once('/').map(|(_, rest)| rest),
+        };
+        let folder = folder.unwrap_or(key).to_string();
+        let tint = self.accent(c, &format!("{folder}/")).unwrap_or(c.on_surface_variant);
+        let resp = fold_row(ui, c, depth, icon, tint, name, false, open, Trail::Text(if open { "" } else { &count }));
         if resp.clicked() {
             toggle(&mut self.opened, key);
         }
+        // Under the pointer the row offers its colors, and keeps the button while they are open.
+        let colors = resp.id.with("colors");
+        let choosing = egui::Popup::is_id_open(ui.ctx(), colors);
+        if choosing || ui.rect_contains_pointer(resp.rect) {
+            let button = Rect::from_center_size(pos2(resp.rect.right() - 20.0, resp.rect.center().y), vec2(26.0, 26.0));
+            let pressed = w::icon_btn(ic::PALETTE, if choosing { "" } else { "Folder color" }).size(26.0).kind(Kind::Tonal).show_at(ui, resp.id.with("color"), button);
+            egui::Popup::menu(&pressed).id(colors).show(|ui| self.color_menu(ui, &folder));
+        }
         resp.context_menu(|ui| {
+            self.color_menu(ui, &folder);
+            w::menu_separator(ui);
             if w::menu_item(ui, ic::STAGE_ALL, &format!("Select all {} inside", members.len())) {
                 (self.mark_group, self.anchor) = (group, None);
                 self.marked = members.iter().cloned().collect();
             }
         });
+    }
+
+    /// The swatches that give a branch folder its color, for a menu. The swatch under
+    /// the pointer is tried on at once, in the sidebar and on the history's labels.
+    fn color_menu(&mut self, ui: &mut Ui, folder: &str) {
+        let current = self.folder_colors.get(folder).copied();
+        let (clicked, hovered) = w::hue_swatches(ui, current);
+        if let Some(hue) = hovered {
+            self.color_preview = Some((folder.to_string(), hue));
+            ui.ctx().request_repaint();
+        }
+        if let Some(hue) = clicked {
+            self.folder_colors.insert(folder.to_string(), hue);
+            ui.close();
+        }
+        if current.is_some() && w::menu_item(ui, ic::CANCEL, "No color") {
+            self.folder_colors.remove(folder);
+        }
+    }
+
+    /// The accent of the colored folder that `branch`, named without its remote, is in.
+    fn accent(&self, c: &Colors, branch: &str) -> Option<Color32> {
+        folder_hue(&self.tints, branch).map(|hue| c.tint(hue).0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1107,7 +1194,7 @@ impl RepoView {
             (a, b) => format!("\u{2191}{a} \u{2193}{b}"),
         };
         let trail = if branch.gone { Trail::Icon(ic::UPSTREAM_GONE, c.error) } else { Trail::Text(&track) };
-        let (icon, tint) = if branch.current { (ic::CHECK_CIRCLE, c.primary) } else { (ic::BRANCH, c.on_surface_variant) };
+        let (icon, tint) = if branch.current { (ic::CHECK_CIRCLE, c.primary) } else { (ic::BRANCH, self.accent(c, &branch.name).unwrap_or(c.on_surface_variant)) };
         let marked = self.is_marked(Group::Local, &branch.name);
         let resp = side_row(ui, c, depth, icon, tint, label, branch.current, marked, trail);
         // Inside a folder the row shows only the last part of the name.
@@ -1131,7 +1218,8 @@ impl RepoView {
     #[allow(clippy::too_many_arguments)]
     fn remote_branch_row(&mut self, ui: &mut Ui, ctx: &Context, snap: &Snapshot, c: &Colors, branch: &Branch, label: &str, depth: usize, order: &[String], remote: &str) {
         let marked = self.is_marked(Group::Remote, &branch.name);
-        let resp = side_row(ui, c, depth, ic::BRANCH, c.on_surface_variant, label, false, marked, Trail::Text("")).on_hover_text(&branch.name);
+        let tint = self.accent(c, branch.name.get(remote.len() + 1..).unwrap_or("")).unwrap_or(c.on_surface_variant);
+        let resp = side_row(ui, c, depth, ic::BRANCH, tint, label, false, marked, Trail::Text("")).on_hover_text(&branch.name);
         let marking = resp.clicked() && self.mark(ui, Group::Remote, order, &branch.name);
         if !marking && resp.double_clicked() {
             self.dialog = Some(dialogs::checkout_remote(branch.name.clone(), remote));
@@ -1336,7 +1424,7 @@ impl RepoView {
                 }
                 resp.context_menu(|ui| self.commit_menu(ui, &ctx, snap, commit));
                 let margin = graph.margins.get(i).copied().unwrap_or(10.0);
-                let tip = paint_commit_row(ui.painter(), &c, row, commit, margin, selected, now, one_remote, resp.hover_pos());
+                let tip = paint_commit_row(ui.painter(), &c, row, commit, margin, selected, now, one_remote, &self.tints, resp.hover_pos());
                 if let Some(tip) = tip {
                     resp.on_hover_text(tip);
                 }
@@ -1562,7 +1650,22 @@ impl RepoView {
             w::empty_state(ui, body, ic::FILE, title, hint);
             return;
         }
-        w::child(ui, "diff-body", body, |ui| paint_diff(ui, &c, &diff));
+        // A change's lines can be staged or unstaged on their own, picked here.
+        let reverse = match &self.diff_spec {
+            Some(DiffSpec::Unstaged(change)) if !change.conflicted() => Some(false),
+            Some(DiffSpec::Staged(_)) => Some(true),
+            _ => None,
+        };
+        let reverse = reverse.filter(|_| diff.patchable());
+        let mut pick = std::mem::take(&mut self.line_pick);
+        let wanted = w::child(ui, "diff-body", body, |ui| paint_diff(ui, &c, &diff, reverse.map(|reverse| (&mut pick, reverse))));
+        self.line_pick = pick;
+        if let (Some(lines), Some(reverse)) = (wanted, reverse)
+            && let Some(patch) = diff.patch(|i| lines.contains(&i), reverse)
+        {
+            let ctx = ui.ctx().clone();
+            self.stage_lines(&ctx, patch, reverse);
+        }
     }
 
     // ------------------------------------------------------------ changes
@@ -1771,21 +1874,37 @@ impl RepoView {
         if clicked {
             self.run(&ctx, vec![if staged { Op::UnstageAll } else { Op::StageAll }]);
         }
-        let flip = |change: &Change| -> Op {
-            let mut paths = vec![change.path.clone()];
-            paths.extend(change.orig.clone());
+        let flip = |changes: &[&Change]| -> Op {
+            let paths = changes.iter().flat_map(|ch| std::iter::once(&ch.path).chain(&ch.orig)).cloned().collect();
             if staged { Op::Unstage { paths } } else { Op::Stage { paths } }
         };
+        let (flip_icon, flip_tip, flip_folder) = if staged { (ic::REMOVE, "Unstage", "Unstage folder") } else { (ic::ADD, "Stage", "Stage folder") };
+        // The button at the right end of the row under the pointer.
+        let flip_btn = |ui: &Ui, resp: &Response, tip: &str| -> bool {
+            let button = Rect::from_center_size(pos2(resp.rect.right() - 20.0, resp.rect.center().y), vec2(26.0, 26.0));
+            ui.rect_contains_pointer(resp.rect) && w::icon_btn(flip_icon, tip).size(26.0).kind(Kind::Tonal).show_at(ui, resp.id.with("toggle"), button).clicked()
+        };
         let list = Rect::from_min_max(pos2(rect.left(), header.bottom()), rect.max);
+        let scope = if staged { "staged" } else { "unstaged" };
+        let paths: Vec<&str> = changes.iter().map(|ch| ch.path.as_str()).collect();
         // ponytail: tree rebuilt every frame, cache it like `file_rows` if huge change sets get slow.
-        let rows = file_rows(changes.iter().copied(), if staged { "staged" } else { "unstaged" }, &self.change_folds);
+        let rows = file_rows(changes.iter().copied(), scope, &self.change_folds);
         w::rows(ui, if staged { "staged-rows" } else { "unstaged-rows" }, list, ROW, rows.len(), None, |ui, range| {
             for row in &rows[range] {
                 let (i, depth) = match row {
                     FileRow::Folder { key, name, depth, open } => {
                         let icon = if *open { ic::FOLDER_OPEN } else { ic::FOLDER };
-                        if fold_row(ui, &c, *depth, icon, c.on_surface_variant, name, false, *open, Trail::Text("")).clicked() {
+                        let resp = fold_row(ui, &c, *depth, icon, c.on_surface_variant, name, false, *open, Trail::Text(""));
+                        // A double click folds and unfolds again, so the folder ends as it was.
+                        if resp.clicked() {
                             toggle(&mut self.change_folds, key);
+                        }
+                        if resp.double_clicked() || flip_btn(ui, &resp, flip_folder) {
+                            // Conflicted files stay: staging one would mark it resolved unseen.
+                            let inside: Vec<&Change> = folder_members(key, scope, &paths).into_iter().map(|i| changes[i]).filter(|ch| !ch.conflicted()).collect();
+                            if !inside.is_empty() {
+                                self.run(&ctx, vec![flip(&inside)]);
+                            }
                         }
                         continue;
                     }
@@ -1808,20 +1927,16 @@ impl RepoView {
                 if resp.double_clicked() && change.conflicted() {
                     self.open_conflict(&ctx, change);
                 } else if resp.double_clicked() {
-                    self.run(&ctx, vec![flip(change)]);
+                    self.run(&ctx, vec![flip(&[change])]);
                 } else if resp.clicked() {
                     self.pick_change(&ctx, change, staged);
                 }
-                if hot {
-                    let button = Rect::from_center_size(pos2(row.right() - 20.0, row.center().y), vec2(26.0, 26.0));
-                    let (icon, tip) = if staged { (ic::REMOVE, "Unstage") } else { (ic::ADD, "Stage") };
-                    if w::icon_btn(icon, tip).size(26.0).kind(Kind::Tonal).show_at(ui, resp.id.with("toggle"), button).clicked() {
-                        self.run(&ctx, vec![flip(change)]);
-                    }
+                if flip_btn(ui, &resp, flip_tip) {
+                    self.run(&ctx, vec![flip(&[change])]);
                 }
                 resp.context_menu(|ui| {
-                    if w::menu_item(ui, if staged { ic::REMOVE } else { ic::ADD }, if staged { "Unstage" } else { "Stage" }) {
-                        self.run(&ctx, vec![flip(change)]);
+                    if w::menu_item(ui, flip_icon, flip_tip) {
+                        self.run(&ctx, vec![flip(&[change])]);
                     }
                     if change.conflicted() {
                         if w::menu_item(ui, ic::EDIT, "Resolve in editor\u{2026}") {
@@ -2006,8 +2121,20 @@ pub(crate) fn tree_rows<'a>(names: &[&'a str], scope: &str, is_open: &dyn Fn(&st
     rows
 }
 
+/// The hue of the folder `branch` is in: that of its nearest colored folder.
+pub(crate) fn folder_hue(colors: &BTreeMap<String, f32>, branch: &str) -> Option<f32> {
+    let mut folder = branch;
+    while let Some((parent, _)) = folder.rsplit_once('/') {
+        if let Some(hue) = colors.get(parent) {
+            return Some(*hue);
+        }
+        folder = parent;
+    }
+    None
+}
+
 /// Indices of the names that live under the folder `key` of the tree built for `scope`.
-fn folder_members(key: &str, scope: &str, names: &[&str]) -> Vec<usize> {
+pub(crate) fn folder_members(key: &str, scope: &str, names: &[&str]) -> Vec<usize> {
     let prefix = format!("{}/", key.get(scope.len() + 1..).unwrap_or(""));
     names.iter().enumerate().filter(|(_, name)| name.starts_with(&prefix)).map(|(index, _)| index).collect()
 }
@@ -2162,7 +2289,7 @@ fn paint_tree_file(p: &Painter, c: &Colors, row: Rect, change: &Change, status: 
 /// Returns a tooltip for what the pointer is over: the full date, or all refs when
 /// some are shortened or folded into `+2`.
 #[allow(clippy::too_many_arguments)]
-fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool, now: i64, one_remote: bool, pointer: Option<Pos2>) -> Option<String> {
+fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin: f32, selected: bool, now: i64, one_remote: bool, hues: &BTreeMap<String, f32>, pointer: Option<Pos2>) -> Option<String> {
     const MAX_CHIPS: usize = 2;
     let fg = if selected { c.on_secondary_container } else { c.on_surface };
     let dim = if selected { c.on_secondary_container } else { c.on_surface_variant };
@@ -2196,6 +2323,10 @@ fn paint_commit_row(p: &Painter, c: &Colors, row: Rect, commit: &Commit, margin:
             RefKind::Remote => (ic::CLOUD, c.surface_highest, c.on_surface_variant),
             RefKind::Tag => (ic::TAG, c.tertiary_container, c.on_tertiary_container),
         };
+        // A branch in a colored folder wears the folder's color; the remote's name is no folder.
+        let path = if r.kind == RefKind::Remote { r.name.split_once('/').map_or("", |(_, rest)| rest) } else { r.name.as_str() };
+        let tinted = matches!(r.kind, RefKind::Local | RefKind::Remote).then(|| folder_hue(hues, path)).flatten();
+        let (fill, on) = tinted.map_or((fill, on), |hue| (c.tint(hue).1, c.tint(hue).2));
         // The cloud already says "remote": with one remote its name adds nothing.
         let name = match (r.kind == RefKind::Remote && one_remote, r.name.split_once('/')) {
             (true, Some((_, rest))) => rest,
@@ -2273,45 +2404,183 @@ fn paint_graph(p: &Painter, graph: &Graph, c: &Colors, origin: Pos2, rows: &Rang
     }
 }
 
-fn paint_diff(ui: &mut Ui, c: &Colors, diff: &Diff) {
+/// Paints a diff. With `pick` (the picked lines, and whether this is a diff of staged
+/// changes) the changes can be staged or unstaged in parts:
+/// - a click on a changed line picks it or lets go of it, Shift-click picks up to it,
+///   and a drag picks or lets go of every line it passes, as its first line did;
+/// - a double click on a changed line, the bar that floats over the diff while lines
+///   are picked, or S (U when unstaging) asks for the picked lines;
+/// - the button in a hunk's header asks for the whole hunk.
+///
+/// Returns the lines asked for.
+fn paint_diff(ui: &mut Ui, c: &Colors, diff: &Diff, mut pick: Option<(&mut LinePick, bool)>) -> Option<BTreeSet<usize>> {
     const LINE: f32 = 20.0;
+    const HUNK: f32 = 34.0;
+    /// Room under the last line, so the floating bar never hides it.
+    const FOOT: f32 = 72.0;
+    let lines = &diff.lines;
     let font = theme::mono(12.5);
     let char_w = w::text_width(ui.painter(), "0", font.clone());
-    let digits = diff.lines.iter().rev().find_map(|l| l.new.or(l.old)).unwrap_or(1).to_string().len().max(3) as f32;
-    let gutter = (digits * 2.0 + 3.0) * char_w + 16.0;
+    let digits = lines.iter().rev().find_map(|l| l.new.or(l.old)).unwrap_or(1).to_string().len().max(3) as f32;
+    // The column of pick marks, when lines can be picked.
+    let marks = if pick.is_some() { 26.0 } else { 0.0 };
+    let gutter = marks + (digits * 2.0 + 3.0) * char_w + 16.0;
     let content_w = gutter + (diff.max_chars as f32 + 4.0) * char_w;
-    ui.spacing_mut().item_spacing.y = 0.0;
-    ScrollArea::both().id_salt("diff-scroll").auto_shrink(false).show_rows(ui, LINE, diff.lines.len(), |ui, range| {
-        ui.set_min_width(content_w);
-        let width = content_w.max(ui.available_width());
-        for line in &diff.lines[range] {
-            let (row, _) = ui.allocate_exact_size(vec2(width, LINE), Sense::hover());
-            let p = ui.painter();
+    let is_change = |i: usize| matches!(lines[i].kind, LineKind::Added | LineKind::Deleted);
+    // Hunk headers are taller than lines, so a row's place depends on the headers above it.
+    // ponytail: found anew every frame, keep them with the diff if huge diffs get slow.
+    let hunks: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].kind == LineKind::Hunk).collect();
+    let top = |i: usize| i as f32 * LINE + hunks.partition_point(|&h| h < i) as f32 * (HUNK - LINE);
+    let row_at = |y: f32| {
+        let (mut low, mut high) = (0, lines.len().saturating_sub(1));
+        while low < high {
+            let mid = (low + high) / 2;
+            if top(mid + 1) <= y { low = mid + 1 } else { high = mid }
+        }
+        low
+    };
+    let (down, pointer, shift) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos(), i.modifiers.shift));
+    let mut wanted = None;
+    let body = ui.max_rect();
+    ScrollArea::both().id_salt("diff-scroll").auto_shrink(false).show_viewport(ui, |ui, viewport| {
+        let origin = ui.cursor().min;
+        let width = content_w.max(viewport.width());
+        ui.allocate_space(vec2(width, top(lines.len()) + if pick.is_some() { FOOT } else { 0.0 }));
+        // What is on screen: headers and buttons stay in it however the diff is scrolled sideways.
+        let seen = Rect::from_min_size(origin + viewport.min.to_vec2(), viewport.size());
+
+        if let Some((pick, _)) = &mut pick
+            && let Some((from, adding, before)) = pick.drag.clone()
+        {
+            match pointer.filter(|_| down) {
+                None => pick.drag = None,
+                Some(at) => {
+                    let to = row_at(at.y - origin.y);
+                    pick.lines = before;
+                    for i in (from.min(to)..=from.max(to)).filter(|&i| is_change(i)) {
+                        if adding { pick.lines.insert(i) } else { pick.lines.remove(&i) };
+                    }
+                    pick.anchor = Some(to);
+                    // Past the top or bottom edge the diff scrolls along.
+                    let past = (seen.top() - at.y).max(0.0) - (at.y - seen.bottom()).max(0.0);
+                    if past != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, past.clamp(-24.0, 24.0)));
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+
+        let picking = pick.as_ref().is_some_and(|(pick, _)| !pick.lines.is_empty());
+        for i in row_at(viewport.min.y)..=row_at(viewport.max.y).min(lines.len().saturating_sub(1)) {
+            let line = &lines[i];
+            let row = Rect::from_min_size(origin + vec2(0.0, top(i)), vec2(width, if line.kind == LineKind::Hunk { HUNK } else { LINE }));
+            let mid = row.center().y;
+            if line.kind == LineKind::Hunk {
+                let band = Rect::from_min_max(pos2(seen.left() + 4.0, row.top() + 6.0), pos2(seen.right() - 4.0, row.bottom()));
+                ui.painter().rect_filled(band, w::radius(shape::SMALL), c.surface_highest);
+                // `@@ -1,4 +1,6 @@` is where; what follows it names the function around.
+                let (place, around) = line.text.get(2..).and_then(|rest| rest.find("@@")).map_or((line.text.as_str(), ""), |at| line.text.split_at(at + 4));
+                let p = ui.painter().with_clip_rect(band.with_max_x(band.right() - if pick.is_some() { 150.0 } else { 0.0 }));
+                let place = p.text(pos2(band.left() + 12.0, band.center().y), Align2::LEFT_CENTER, place, theme::mono(11.5), c.outline);
+                p.text(pos2(place.right() + 6.0, band.center().y), Align2::LEFT_CENTER, around.trim(), theme::mono(12.0), c.on_surface_variant);
+                let Some((_, reverse)) = &pick else { continue };
+                let (label, icon, tip) = if *reverse { ("Unstage hunk", ic::REMOVE, "Unstage every change in this hunk") } else { ("Stage hunk", ic::ADD, "Stage every change in this hunk") };
+                let pressed = w::hchild(ui, &format!("hunk-{i}"), band.shrink2(vec2(2.0, 0.0)), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| w::btn(label).icon(icon).kind(Kind::Text).height(24.0).show(ui).on_hover_text(tip).clicked()).inner
+                });
+                if pressed {
+                    let end = hunks.get(hunks.partition_point(|&h| h <= i)).copied().unwrap_or(lines.len());
+                    wanted = Some((i + 1..end).collect());
+                }
+                continue;
+            }
             let (bg, sign, fg) = match line.kind {
                 LineKind::Added => (c.diff_added, "+", c.on_surface),
                 LineKind::Deleted => (c.diff_deleted, "\u{2212}", c.on_surface),
-                LineKind::Hunk => (c.surface_highest, "", c.on_surface_variant),
-                LineKind::Context => (Color32::TRANSPARENT, "", c.on_surface),
                 LineKind::Note => (Color32::TRANSPARENT, "", c.on_surface_variant),
+                _ => (Color32::TRANSPARENT, "", c.on_surface),
             };
-            let mid = row.center().y;
-            if line.kind == LineKind::Hunk {
-                p.rect_filled(row.shrink2(vec2(4.0, 1.0)), w::radius(shape::SMALL), bg);
-                p.text(pos2(row.left() + 14.0, mid), Align2::LEFT_CENTER, &line.text, font.clone(), fg);
-                continue;
+            ui.painter().rect_filled(row, 0.0, bg);
+            if let Some((pick, _)) = &mut pick {
+                // Unchanged lines take part too, so that a drag can begin or end on one.
+                let resp = ui.interact(row, ui.scope_id().with(("line", i)), Sense::click_and_drag());
+                if resp.drag_started_by(egui::PointerButton::Primary) {
+                    pick.drag = Some((i, !pick.lines.contains(&i), pick.lines.clone()));
+                }
+                if is_change(i) {
+                    let hot = resp.hovered() && pick.drag.is_none();
+                    if resp.double_clicked() {
+                        // The first click of the two may have let go of this line.
+                        pick.lines.insert(i);
+                        wanted = Some(pick.lines.clone());
+                    } else if resp.clicked() {
+                        match pick.anchor.filter(|_| shift) {
+                            Some(from) => pick.lines.extend((from.min(i)..=from.max(i)).filter(|&j| is_change(j))),
+                            None if pick.lines.contains(&i) => drop(pick.lines.remove(&i)),
+                            None => drop(pick.lines.insert(i)),
+                        }
+                        pick.anchor = Some(i);
+                    }
+                    let p = ui.painter();
+                    if hot {
+                        p.rect_filled(row, 0.0, c.on_surface.gamma_multiply(0.06));
+                    }
+                    // The mark: filled when picked, an empty ring where a click would pick.
+                    let mark = pos2(row.left() + marks / 2.0 + 1.0, mid);
+                    if pick.lines.contains(&i) {
+                        p.rect_filled(row.with_max_x(row.left() + 3.0), 0.0, c.primary);
+                        p.circle_filled(mark, 7.5, c.primary);
+                        w::icon_at(p, mark, ic::CHECK, 12.0, c.on_primary);
+                    } else if hot || picking {
+                        p.circle_stroke(mark, 6.5, Stroke::new(1.5, if hot { c.on_surface_variant } else { c.outline }));
+                    }
+                    resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                }
             }
-            p.rect_filled(row, 0.0, bg);
+            let p = ui.painter();
             let number = |n: Option<u32>, right: f32| {
                 if let Some(n) = n {
                     p.text(pos2(right, mid), Align2::RIGHT_CENTER, n, font.clone(), c.on_surface_variant.gamma_multiply(0.7));
                 }
             };
-            number(line.old, row.left() + 8.0 + digits * char_w);
-            number(line.new, row.left() + 8.0 + (digits * 2.0 + 1.0) * char_w);
+            number(line.old, row.left() + marks + 8.0 + digits * char_w);
+            number(line.new, row.left() + marks + 8.0 + (digits * 2.0 + 1.0) * char_w);
             p.text(pos2(row.left() + gutter - 2.0 * char_w, mid), Align2::LEFT_CENTER, sign, font.clone(), fg);
             p.text(pos2(row.left() + gutter, mid), Align2::LEFT_CENTER, &line.text, font.clone(), fg);
         }
     });
+
+    // The picked lines' bar floats over the foot of the diff, and rises into place.
+    let Some((pick, reverse)) = pick else { return wanted };
+    let count = pick.lines.len();
+    let risen = ui.ctx().animate_bool_with_time(ui.scope_id().with("line-bar"), count > 0, 0.16);
+    if count == 0 {
+        return wanted;
+    }
+    let (label, icon, key, tip) = if reverse { ("Unstage lines", ic::REMOVE, Key::U, "Unstage the picked lines (U)") } else { ("Stage lines", ic::ADD, Key::S, "Stage the picked lines (S)") };
+    if ui.memory(|m| m.focused().is_none()) && ui.input(|i| i.key_pressed(key) && i.modifiers.is_none()) {
+        wanted = Some(pick.lines.clone());
+    }
+    let size = vec2(body.width().min(380.0) - 24.0, 48.0);
+    let bar = Rect::from_center_size(pos2(body.center().x, body.bottom() - 16.0 - size.y / 2.0 + (1.0 - risen) * 24.0), size);
+    ui.interact(bar, ui.scope_id().with("line-bar"), Sense::click()); // a click on the bar is not one on the line under it
+    ui.painter().add(egui::epaint::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(96) }.as_shape(bar, w::radius(24.0)));
+    w::card(ui, bar, c.secondary_container, 24.0);
+    w::hchild(ui, "line-bar", bar.shrink2(vec2(6.0, 0.0)), |ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if w::icon_btn(ic::CLOSE, "Let go of the picked lines (Esc)").size(36.0).show(ui).clicked() {
+            *pick = LinePick::default();
+        }
+        let picked = format!("{count} line{} picked", if count == 1 { "" } else { "s" });
+        ui.label(egui::RichText::new(picked).font(theme::emph(13.5)).color(c.on_secondary_container));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if w::btn(label).icon(icon).height(36.0).show(ui).on_hover_text(tip).clicked() {
+                wanted = Some(pick.lines.clone());
+            }
+        });
+    });
+    wanted
 }
 
 /// Selection change for a Ctrl or Shift click on `key`. Shift selects the range from the

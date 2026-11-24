@@ -138,6 +138,22 @@ pub struct Colors {
     pub deleted: Color32,
 }
 
+/// The hues a branch folder can be given, by name: twelve, spread round the wheel.
+pub const FOLDER_HUES: [(&str, f32); 12] = [
+    ("Red", 25.0),
+    ("Orange", 50.0),
+    ("Amber", 75.0),
+    ("Lime", 110.0),
+    ("Green", 145.0),
+    ("Teal", 180.0),
+    ("Cyan", 215.0),
+    ("Blue", 250.0),
+    ("Indigo", 280.0),
+    ("Violet", 305.0),
+    ("Pink", 335.0),
+    ("Rose", 0.0),
+];
+
 fn rgb(c: Rgb) -> Color32 {
     Color32::from_rgb(c.red, c.green, c.blue)
 }
@@ -147,6 +163,16 @@ fn hct(hue: f64, chroma: f64, tone: f64) -> Color32 {
 }
 
 impl Colors {
+    /// A hue in this theme's tones: an accent for icons (as bright as the graph's
+    /// lanes), a container, and the color of text on that container.
+    pub fn tint(&self, hue: f32) -> (Color32, Color32, Color32) {
+        let hue = f64::from(hue);
+        match self.dark {
+            true => (hct(hue, 58.0, 74.0), hct(hue, 40.0, 28.0), hct(hue, 40.0, 90.0)),
+            false => (hct(hue, 58.0, 48.0), hct(hue, 45.0, 90.0), hct(hue, 45.0, 22.0)),
+        }
+    }
+
     pub fn build(prefs: &ThemePrefs, system_dark: bool) -> Self {
         let dark = match prefs.mode {
             Mode::System => system_dark,
